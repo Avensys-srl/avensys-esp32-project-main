@@ -1,0 +1,14 @@
+---
+BasedOnStyle: Google
+AccessModifierOffset: "0"
+AlignAfterOpenBracket: Align
+AlignConsecutiveMacros: "true"
+AlignConsecutiveAssignments: "true"
+AlignConsecutiveDeclarations: "true"
+AlignEscapedNewlines: Left
+ColumnLimit: "180"
+IncludeBlocks: Regroup
+IndentWidth: "4"
+Language: Cpp
+TabWidth: "4"
+UseTab: Never
