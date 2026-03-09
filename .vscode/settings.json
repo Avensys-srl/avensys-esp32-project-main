@@ -30,5 +30,6 @@
     },
     "clang-format.assumeFilename": ".clang-format",
     "commentTranslate.hover.enabled": true,
-    "idf.adapterTargetName": "esp32"
+    "idf.adapterTargetName": "esp32",
+    "idf.currentSetup": "C:/Users/PC/Desktop/esp-idf/"
 }

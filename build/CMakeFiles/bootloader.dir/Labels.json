@@ -1,0 +1,43 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "W:/AELEBDWRL02/avensys-esp32-project-main/build/CMakeFiles/bootloader"
+		},
+		{
+			"file" : "W:/AELEBDWRL02/avensys-esp32-project-main/build/CMakeFiles/bootloader.rule"
+		},
+		{
+			"file" : "W:/AELEBDWRL02/avensys-esp32-project-main/build/CMakeFiles/bootloader-complete.rule"
+		},
+		{
+			"file" : "W:/AELEBDWRL02/avensys-esp32-project-main/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule"
+		},
+		{
+			"file" : "W:/AELEBDWRL02/avensys-esp32-project-main/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule"
+		},
+		{
+			"file" : "W:/AELEBDWRL02/avensys-esp32-project-main/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule"
+		},
+		{
+			"file" : "W:/AELEBDWRL02/avensys-esp32-project-main/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule"
+		},
+		{
+			"file" : "W:/AELEBDWRL02/avensys-esp32-project-main/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule"
+		},
+		{
+			"file" : "W:/AELEBDWRL02/avensys-esp32-project-main/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule"
+		},
+		{
+			"file" : "W:/AELEBDWRL02/avensys-esp32-project-main/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"bootloader"
+		],
+		"name" : "bootloader"
+	}
+}
