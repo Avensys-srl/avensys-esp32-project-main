@@ -1,5 +1,6 @@
 #include "ble.h"
 #include "main.h"
+#include "freertos/timers.h"
 
 /* The max length of characteristic value. When the GATT client performs a write or prepare write operation,
  *  the data length must be less than ESP_BLE_CHAR_VAL_LEN_MAX.
@@ -11,8 +12,6 @@
 
 #define ADV_CONFIG_FLAG      (1 << 0)
 #define SCAN_RSP_CONFIG_FLAG (1 << 1)
-#define TEMP_BUFFER_SIZE 32
-char temp_buffer[TEMP_BUFFER_SIZE + 1]; // +1 per il terminatore di stringa nullo
 
 static uint8_t adv_config_done = 0;
 
@@ -39,6 +38,162 @@ ble_packet_t ssid_packet = {0};
 ble_packet_t password_packet = {0};
 
 static prepare_type_env_t prepare_write_env;
+static TimerHandle_t s_ble_provision_timer = NULL;
+static uint8_t s_prov_status_value = 0;
+static bool s_prov_status_notify = false;
+static uint16_t s_conn_id = 0;
+static esp_gatt_if_t s_gatts_if = ESP_GATT_IF_NONE;
+
+#define BLE_PROVISION_TIMEOUT_MS 90000
+
+#define PROV_STATE_IDLE          0
+#define PROV_STATE_WAIT_SSID     1
+#define PROV_STATE_WAIT_PASSWORD 2
+#define PROV_STATE_READY         3
+#define PROV_STATE_APPLYING      4
+#define PROV_STATE_DONE          5
+#define PROV_STATE_ERROR         6
+
+static void ble_reset_credential_packets(void);
+static bool ble_packet_append(ble_packet_t *packet, const uint8_t *data, size_t len, size_t max_len, const char *label);
+static void ble_packet_copy_to_string(const ble_packet_t *packet, char *out, size_t out_size);
+static void ble_provision_timeout_cb(TimerHandle_t xTimer);
+static void ble_restart_provision_timer(void);
+static void ble_stop_provision_timer(void);
+static void ble_security_init(void);
+static void ble_set_provision_status(uint8_t status);
+
+static bool ble_packet_append(ble_packet_t *packet, const uint8_t *data, size_t len, size_t max_len, const char *label) {
+    if (packet->data == NULL) {
+        packet->data = malloc(len);
+        if (packet->data == NULL) {
+            ESP_LOGE(GATTS_TABLE_TAG, "Failed to allocate memory for %s packet", label);
+            return false;
+        }
+        memcpy(packet->data, data, len);
+        packet->len = len;
+        return true;
+    }
+
+    size_t new_len = packet->len + len;
+    if (new_len > max_len) {
+        ESP_LOGE(GATTS_TABLE_TAG, "%s packet length exceeds maximum length", label);
+        free(packet->data);
+        packet->data = NULL;
+        packet->len = 0;
+        return false;
+    }
+
+    uint8_t *new_data = realloc(packet->data, new_len);
+    if (new_data == NULL) {
+        ESP_LOGE(GATTS_TABLE_TAG, "Failed to reallocate memory for %s packet", label);
+        free(packet->data);
+        packet->data = NULL;
+        packet->len = 0;
+        return false;
+    }
+
+    memcpy(new_data + packet->len, data, len);
+    packet->data = new_data;
+    packet->len = new_len;
+    return true;
+}
+
+static void ble_packet_copy_to_string(const ble_packet_t *packet, char *out, size_t out_size) {
+    size_t copy_len = packet->len;
+
+    if (out_size == 0) {
+        return;
+    }
+    if (packet->data == NULL) {
+        out[0] = '\0';
+        return;
+    }
+    if (copy_len >= out_size) {
+        copy_len = out_size - 1;
+    }
+
+    memcpy(out, packet->data, copy_len);
+    out[copy_len] = '\0';
+}
+
+static void ble_reset_credential_packets(void) {
+    if (ssid_packet.data != NULL) {
+        free(ssid_packet.data);
+        ssid_packet.data = NULL;
+    }
+    ssid_packet.len = 0;
+
+    if (password_packet.data != NULL) {
+        free(password_packet.data);
+        password_packet.data = NULL;
+    }
+    password_packet.len = 0;
+}
+
+static void ble_set_provision_status(uint8_t status) {
+    s_prov_status_value = status;
+
+    if (ble_handle_table[IDX_CHAR_VAL_PROV_STATUS] != 0) {
+        esp_ble_gatts_set_attr_value(ble_handle_table[IDX_CHAR_VAL_PROV_STATUS], sizeof(s_prov_status_value), &s_prov_status_value);
+    }
+
+    if (s_prov_status_notify && s_gatts_if != ESP_GATT_IF_NONE && ble_handle_table[IDX_CHAR_VAL_PROV_STATUS] != 0) {
+        (void)esp_ble_gatts_send_indicate(s_gatts_if,
+                                          s_conn_id,
+                                          ble_handle_table[IDX_CHAR_VAL_PROV_STATUS],
+                                          sizeof(s_prov_status_value),
+                                          &s_prov_status_value,
+                                          false);
+    }
+}
+
+static void ble_provision_timeout_cb(TimerHandle_t xTimer) {
+    (void)xTimer;
+    ESP_LOGW(GATTS_TABLE_TAG, "BLE provisioning timeout, resetting pending SSID/password");
+    ble_reset_credential_packets();
+    wifi_is_ssid_send = false;
+    wifi_is_pass_send = false;
+    connect_to_wifi = false;
+    ble_set_provision_status(PROV_STATE_ERROR);
+}
+
+static void ble_restart_provision_timer(void) {
+    if (s_ble_provision_timer == NULL) {
+        s_ble_provision_timer = xTimerCreate("ble_prov_to",
+                                             pdMS_TO_TICKS(BLE_PROVISION_TIMEOUT_MS),
+                                             pdFALSE,
+                                             NULL,
+                                             ble_provision_timeout_cb);
+        if (s_ble_provision_timer == NULL) {
+            ESP_LOGW(GATTS_TABLE_TAG, "Failed to create BLE provisioning timer");
+            return;
+        }
+    }
+
+    (void)xTimerStop(s_ble_provision_timer, 0);
+    (void)xTimerStart(s_ble_provision_timer, 0);
+}
+
+static void ble_stop_provision_timer(void) {
+    if (s_ble_provision_timer != NULL) {
+        (void)xTimerStop(s_ble_provision_timer, 0);
+    }
+}
+
+static void ble_security_init(void) {
+    esp_ble_auth_req_t auth_req = ESP_LE_AUTH_REQ_SC_BOND;
+    esp_ble_io_cap_t iocap = ESP_IO_CAP_NONE;
+    uint8_t key_size = 16;
+    uint8_t init_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+    uint8_t resp_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+
+    (void)esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth_req, sizeof(auth_req));
+    (void)esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &iocap, sizeof(iocap));
+    (void)esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, sizeof(key_size));
+    (void)esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, sizeof(init_key));
+    (void)esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &resp_key, sizeof(resp_key));
+}
 
 static uint8_t service_uuid[16] = {
     /* LSB <--------------------------------------------------------------------------------> MSB */
@@ -128,6 +283,7 @@ static const uint16_t GATTS_CHAR_UUID_CONNECT_TO_CLOUD = 0xFF07;
 static const uint16_t GATTS_CHAR_UUID_OTA_URL          = 0xFF08;
 static const uint16_t GATTS_CHAR_UUID_UPDATE_FIRMWARE  = 0xFF09;
 static const uint16_t GATTS_CHAR_UUID_DEVICE_ID        = 0xFF0A;
+static const uint16_t GATTS_CHAR_UUID_PROV_STATUS      = 0xFF0B;
 
 static const uint16_t primary_service_uuid         = ESP_GATT_UUID_PRI_SERVICE;
 static const uint16_t character_declaration_uuid   = ESP_GATT_UUID_CHAR_DECLARE;
@@ -139,6 +295,7 @@ static const uint8_t char_prop_read_write_notify = ESP_GATT_CHAR_PROP_BIT_WRITE 
 static const uint8_t a_ccc[2] = {0x00, 0x00};
 static const uint8_t b_ccc[2] = {0x00, 0x00};
 static const uint8_t c_ccc[2] = {0x00, 0x00};
+static const uint8_t status_ccc[2] = {0x00, 0x00};
 
 static const uint8_t char_value[4] = {0x11, 0x22, 0x33, 0x44};
 
@@ -204,7 +361,7 @@ static const esp_gatts_attr_db_t gatt_db[HRS_IDX_NB] = {
 
     /* Characteristic Value */
     [IDX_CHAR_VAL_WIFI_SSID] = {{ESP_GATT_AUTO_RSP},
-                                {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_WIFI_SSID, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, ESP_BLE_CHAR_VAL_LEN_MAX, sizeof(WIFI_SSID),
+                                {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_WIFI_SSID, ESP_GATT_PERM_READ_ENCRYPTED | ESP_GATT_PERM_WRITE_ENCRYPTED, ESP_BLE_CHAR_VAL_LEN_MAX, sizeof(WIFI_SSID),
                                  (uint8_t *)WIFI_SSID}},
 
     /* Client Characteristic Configuration Descriptor */
@@ -220,7 +377,7 @@ static const esp_gatts_attr_db_t gatt_db[HRS_IDX_NB] = {
 
     /* Characteristic Value */
     [IDX_CHAR_VAL_WIFI_PASSWORD] = {{ESP_GATT_AUTO_RSP},
-                                    {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_WIFI_PASSWORD, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, ESP_BLE_CHAR_VAL_LEN_MAX,
+                                    {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_WIFI_PASSWORD, ESP_GATT_PERM_READ_ENCRYPTED | ESP_GATT_PERM_WRITE_ENCRYPTED, ESP_BLE_CHAR_VAL_LEN_MAX,
                                      sizeof(WIFI_PASSWORD), (uint8_t *)WIFI_PASSWORD}},
 
     /* Client Characteristic Configuration Descriptor */
@@ -291,6 +448,22 @@ static const esp_gatts_attr_db_t gatt_db[HRS_IDX_NB] = {
     [IDX_CHAR_CONNECT_TO_CLOUD_CFG] = {{ESP_GATT_AUTO_RSP},
                                        {ESP_UUID_LEN_16, (uint8_t *)&character_client_config_uuid, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, sizeof(uint16_t), sizeof(c_ccc),
                                         (uint8_t *)c_ccc}},
+
+    /****************************** PROVISION STATUS ******************************/
+    /* Characteristic Declaration */
+    [IDX_CHAR_PROV_STATUS] = {{ESP_GATT_AUTO_RSP},
+                               {ESP_UUID_LEN_16, (uint8_t *)&character_declaration_uuid, ESP_GATT_PERM_READ, CHAR_DECLARATION_SIZE, CHAR_DECLARATION_SIZE,
+                                (uint8_t *)&char_prop_read_write_notify}},
+
+    /* Characteristic Value */
+    [IDX_CHAR_VAL_PROV_STATUS] = {{ESP_GATT_AUTO_RSP},
+                                   {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_PROV_STATUS, ESP_GATT_PERM_READ, sizeof(s_prov_status_value),
+                                    sizeof(s_prov_status_value), (uint8_t *)&s_prov_status_value}},
+
+    /* Client Characteristic Configuration Descriptor */
+    [IDX_CHAR_PROV_STATUS_CFG] = {{ESP_GATT_AUTO_RSP},
+                                   {ESP_UUID_LEN_16, (uint8_t *)&character_client_config_uuid, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, sizeof(uint16_t),
+                                    sizeof(status_ccc), (uint8_t *)status_ccc}},
 };
 
 
@@ -345,6 +518,16 @@ void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
             ESP_LOGI(GATTS_TABLE_TAG, "update connection params status = %d, min_int = %d, max_int = %d,conn_int = %d,latency = %d, timeout = %d", param->update_conn_params.status,
                      param->update_conn_params.min_int, param->update_conn_params.max_int, param->update_conn_params.conn_int, param->update_conn_params.latency,
                      param->update_conn_params.timeout);
+            break;
+        case ESP_GAP_BLE_SEC_REQ_EVT:
+            esp_ble_gap_security_rsp(param->ble_security.ble_req.bd_addr, true);
+            break;
+        case ESP_GAP_BLE_AUTH_CMPL_EVT:
+            if (param->ble_security.auth_cmpl.success) {
+                ESP_LOGI(GATTS_TABLE_TAG, "BLE auth complete");
+            } else {
+                ESP_LOGW(GATTS_TABLE_TAG, "BLE auth failed, reason=%d", param->ble_security.auth_cmpl.fail_reason);
+            }
             break;
         default:
             break;
@@ -432,6 +615,7 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             if (set_dev_name_ret) {
                 ESP_LOGE(GATTS_TABLE_TAG, "set device name failed, error code = %x", set_dev_name_ret);
             }
+            ble_security_init();
 
             // config adv data
             esp_err_t ret = esp_ble_gap_config_adv_data(&adv_data);
@@ -460,42 +644,24 @@ case ESP_GATTS_WRITE_EVT:
                 ESP_LOGI(GATTS_TABLE_TAG, "GATT_WRITE_EVT, handle = %d, value len = %d", param->write.handle, param->write.len);
                 esp_log_buffer_hex(GATTS_TABLE_TAG, param->write.value, param->write.len);
 
-                    if (param->write.handle == ble_handle_table[IDX_CHAR_VAL_WIFI_SSID]) {
-                        ESP_LOGI(GATTS_TABLE_TAG, "WIFI SSID");
+                if (param->write.handle == ble_handle_table[IDX_CHAR_VAL_WIFI_SSID]) {
+                    ESP_LOGI(GATTS_TABLE_TAG, "WIFI SSID");
+                    ble_restart_provision_timer();
 
-                    if (ssid_packet.data == NULL) {
-                    ssid_packet.data = malloc(param->write.len);
-                    if (ssid_packet.data == NULL) {
-                        ESP_LOGE(GATTS_TABLE_TAG, "Failed to allocate memory for SSID packet");
+                    if (!ble_packet_append(&ssid_packet, param->write.value, param->write.len, MAX_SSID_LENGTH, "SSID")) {
+                        ble_reset_credential_packets();
+                        wifi_is_ssid_send = false;
+                        connect_to_wifi = false;
                         break;
                     }
-                    memcpy(ssid_packet.data, param->write.value, param->write.len);
-                    ssid_packet.len = param->write.len;
-                    } else {
-                        size_t new_len = ssid_packet.len + param->write.len;
-                        if (new_len <= MAX_SSID_LENGTH) {
-                            uint8_t *new_data = realloc(ssid_packet.data, new_len);
-                            if (new_data == NULL) {
-                                ESP_LOGE(GATTS_TABLE_TAG, "Failed to reallocate memory for SSID packet");
-                                free(ssid_packet.data);
-                                ssid_packet.data = NULL;
-                                break;
-                            }
-                            memcpy(new_data + ssid_packet.len, param->write.value, param->write.len);
-                            ssid_packet.data = new_data;
-                            ssid_packet.len = new_len;
-                        } else {
-                            ESP_LOGE(GATTS_TABLE_TAG, "SSID packet length exceeds maximum length");
-                            free(ssid_packet.data);
-                            ssid_packet.data = NULL;
-                        }
-                    }
 
-                    
+                    ble_packet_copy_to_string(&ssid_packet, WIFI_SSID, sizeof(WIFI_SSID));
                     wifi_is_ssid_send = true;
-
-                    memcpy(WIFI_SSID, ssid_packet.data, ssid_packet.len);
-                    WIFI_SSID[ssid_packet.len] = '\0';
+                    if (wifi_is_pass_send) {
+                        ble_set_provision_status(PROV_STATE_READY);
+                    } else {
+                        ble_set_provision_status(PROV_STATE_WAIT_PASSWORD);
+                    }
 
                     // Scrivi SSID nella NVS
                     esp_err_t err = nvs_write_string("wifi_ssid", WIFI_SSID);
@@ -504,44 +670,24 @@ case ESP_GATTS_WRITE_EVT:
                     } else {
                         ESP_LOGI(GATTS_TABLE_TAG, "SSID written to NVS successfully");
                     }
-
-
                 } else if (param->write.handle == ble_handle_table[IDX_CHAR_VAL_WIFI_PASSWORD]) {
                     ESP_LOGI(GATTS_TABLE_TAG, "WIFI Password");
-                    
-                if (password_packet.data == NULL) {
-                    password_packet.data = malloc(param->write.len);
-                    if (password_packet.data == NULL) {
-                        ESP_LOGE(GATTS_TABLE_TAG, "Failed to allocate memory for SSID packet");
+                    ble_restart_provision_timer();
+
+                    if (!ble_packet_append(&password_packet, param->write.value, param->write.len, MAX_PASSWORD_LENGTH, "password")) {
+                        ble_reset_credential_packets();
+                        wifi_is_pass_send = false;
+                        connect_to_wifi = false;
                         break;
                     }
-                    memcpy(password_packet.data, param->write.value, param->write.len);
-                    password_packet.len = param->write.len;
-                    } else {
-                        size_t new_len = password_packet.len + param->write.len;
-                        if (new_len <= MAX_SSID_LENGTH) {
-                            uint8_t *new_data = realloc(password_packet.data, new_len);
-                            if (new_data == NULL) {
-                                ESP_LOGE(GATTS_TABLE_TAG, "Failed to reallocate memory for SSID packet");
-                                free(password_packet.data);
-                                password_packet.data = NULL;
-                                break;
-                            }
-                            memcpy(new_data + password_packet.len, param->write.value, param->write.len);
-                            password_packet.data = new_data;
-                            password_packet.len = new_len;
-                        } else {
-                            ESP_LOGE(GATTS_TABLE_TAG, "SSID packet length exceeds maximum length");
-                            free(password_packet.data);
-                            password_packet.data = NULL;
-                        }
-                    }
 
-
+                    ble_packet_copy_to_string(&password_packet, WIFI_PASSWORD, sizeof(WIFI_PASSWORD));
                     wifi_is_pass_send = true;
-                    connect_to_wifi   = true;
-                    memcpy(WIFI_PASSWORD, password_packet.data, password_packet.len);
-                    WIFI_PASSWORD[password_packet.len] = '\0';
+                    if (wifi_is_ssid_send) {
+                        ble_set_provision_status(PROV_STATE_READY);
+                    } else {
+                        ble_set_provision_status(PROV_STATE_WAIT_SSID);
+                    }
 
                     // Scrivi Password nella NVS
                     esp_err_t err = nvs_write_string("wifi_pass", WIFI_PASSWORD);
@@ -550,7 +696,23 @@ case ESP_GATTS_WRITE_EVT:
                     } else {
                         ESP_LOGI(GATTS_TABLE_TAG, "Password written to NVS successfully");
                     }
-                } 
+                } else if (param->write.handle == ble_handle_table[IDX_CHAR_VAL_CONNECT_TO_CLOUD]) {
+                    if (wifi_is_ssid_send && wifi_is_pass_send) {
+                        ble_set_provision_status(PROV_STATE_APPLYING);
+                    } else {
+                        ble_set_provision_status(PROV_STATE_ERROR);
+                    }
+                } else if (param->write.handle == ble_handle_table[IDX_CHAR_PROV_STATUS_CFG] && param->write.len == 2) {
+                    uint16_t notify_en = ((uint16_t)param->write.value[1] << 8) | param->write.value[0];
+                    s_prov_status_notify = (notify_en == 0x0001);
+                }
+
+                connect_to_wifi = (wifi_is_ssid_send && wifi_is_pass_send);
+                if (connect_to_wifi) {
+                    ble_stop_provision_timer();
+                    ble_reset_credential_packets();
+                    ble_set_provision_status(PROV_STATE_DONE);
+                }
                 if (param->write.need_rsp) {
                     esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, NULL);
                 }
@@ -576,6 +738,11 @@ case ESP_GATTS_WRITE_EVT:
         case ESP_GATTS_CONNECT_EVT:
             ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATTS_CONNECT_EVT, conn_id = %d", param->connect.conn_id);
             esp_log_buffer_hex(GATTS_TABLE_TAG, param->connect.remote_bda, 6);
+            s_conn_id = param->connect.conn_id;
+            s_gatts_if = gatts_if;
+            esp_ble_set_encryption(param->connect.remote_bda, ESP_BLE_SEC_ENCRYPT_NO_MITM);
+            ble_restart_provision_timer();
+            ble_set_provision_status(PROV_STATE_WAIT_SSID);
             esp_ble_conn_update_params_t conn_params = {0};
             memcpy(conn_params.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
             /* For the iOS system, please refer to Apple official documents about the BLE connection parameters restrictions. */
@@ -588,6 +755,14 @@ case ESP_GATTS_WRITE_EVT:
             break;
         case ESP_GATTS_DISCONNECT_EVT:
             ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATTS_DISCONNECT_EVT, reason = 0x%x", param->disconnect.reason);
+            ble_stop_provision_timer();
+            ble_reset_credential_packets();
+            wifi_is_ssid_send = false;
+            wifi_is_pass_send = false;
+            connect_to_wifi = false;
+            s_prov_status_notify = false;
+            s_gatts_if = ESP_GATT_IF_NONE;
+            ble_set_provision_status(PROV_STATE_IDLE);
             esp_ble_gap_start_advertising(&adv_params);
             break;
         case ESP_GATTS_CREAT_ATTR_TAB_EVT: {
@@ -602,6 +777,7 @@ case ESP_GATTS_WRITE_EVT:
                 ESP_LOGI(GATTS_TABLE_TAG, "create attribute table successfully, the number handle = %d\n", param->add_attr_tab.num_handle);
                 memcpy(ble_handle_table, param->add_attr_tab.handles, sizeof(ble_handle_table));
                 esp_ble_gatts_start_service(ble_handle_table[IDX_SVC]);
+                ble_set_provision_status(PROV_STATE_IDLE);
             }
             break;
         }

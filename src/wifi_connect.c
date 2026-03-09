@@ -38,14 +38,11 @@
 // Define a timeout period for Wi-Fi connection attempts
 #define WIFI_CONNECT_TIMEOUT_MS 30000
 
-// Timer handle
-static TimerHandle_t s_connect_timer;
-
-
 static EventGroupHandle_t s_connect_event_group;
 static esp_ip4_addr_t     s_ip_addr;
 static const char        *s_connection_name;
 static esp_netif_t       *s_wifi_esp_netif = NULL;
+static bool               s_shutdown_handler_registered = false;
 
 static const char *TAG = "wifi_connect";
 
@@ -57,52 +54,20 @@ extern esp_err_t nvs_read_string(const char* key, char* value, size_t max_len);
 extern void Quarke_Update_task (void *pvParameters);
 
 /* set up connection, Wi-Fi or Ethernet */
-static void start(const char *ssid, const char *passwd);
+static esp_err_t start(const char *ssid, const char *passwd);
 
 /* tear down connection, release resources */
 static void stop(void);
 
-// Function prototypes
-static void connect_timer_callback(TimerHandle_t xTimer);
-
-
 static void on_got_ip(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+    (void)arg;
+    (void)event_base;
+    (void)event_id;
     ESP_LOGI(TAG, "Got IP event!");
     ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
     memcpy(&s_ip_addr, &event->ip_info.ip, sizeof(s_ip_addr));
-    xEventGroupSetBits(s_connect_event_group, GOT_IPV4_BIT);
-
-}
-
-
-
-static void connect_timer_callback(TimerHandle_t xTimer) {
-    ESP_LOGI(TAG, "Connection attempt timed out, attempting to re-read SSID and password...");
-    // Stop the Wi-Fi and delete the event group to trigger a re-read of SSID and password
-    stop();
-    // Call the function to re-read SSID and password here
-    // e.g., read_ssid_password_from_bluetooth();
-    // Restart Wi-Fi connection with new SSID and password
-    esp_err_t err;
-    
-    err = nvs_read_string("wifi_ssid", WIFI_SSID, sizeof(WIFI_SSID));
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to read SSID from NVS (%s)", esp_err_to_name(err));
-    } else {
-        ESP_LOGI(TAG, "SSID read from NVS: %s", WIFI_SSID);
-    }
-
-    err = nvs_read_string("wifi_pass", WIFI_PASSWORD, sizeof(WIFI_PASSWORD));
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to read password from NVS (%s)", esp_err_to_name(err));
-    } else {
-        ESP_LOGI(TAG, "Password read from NVS");
-    }
-
-    // Restart Wi-Fi connection with new SSID and password
-    esp_err_t res = wifi_connect(WIFI_SSID, WIFI_PASSWORD);
-    if (res != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to reconnect to Wi-Fi");
+    if (s_connect_event_group != NULL) {
+        xEventGroupSetBits(s_connect_event_group, GOT_IPV4_BIT);
     }
 }
 
@@ -117,26 +82,37 @@ void check_wifi_signal_strength(void) {
 
 
 esp_err_t wifi_connect(const char *ssid, const char *passwd) {
+    esp_err_t err;
+
     if (s_connect_event_group != NULL) {
         return ESP_ERR_INVALID_STATE;
     }
+
     s_connect_event_group = xEventGroupCreate();
-    start(ssid, passwd);
-    ESP_ERROR_CHECK(esp_register_shutdown_handler(&stop));
+    if (s_connect_event_group == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    err = start(ssid, passwd);
+    if (err != ESP_OK) {
+        vEventGroupDelete(s_connect_event_group);
+        s_connect_event_group = NULL;
+        return err;
+    }
+
+    if (!s_shutdown_handler_registered) {
+        err = esp_register_shutdown_handler(&stop);
+        if (err == ESP_OK) {
+            s_shutdown_handler_registered = true;
+        } else {
+            ESP_LOGW(TAG, "esp_register_shutdown_handler failed: %s", esp_err_to_name(err));
+        }
+    }
+
     ESP_LOGI(TAG, "Waiting for IP");
 
-    // Start the connection timeout timer
-    s_connect_timer = xTimerCreate("connect_timer", pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS), pdFALSE, NULL, connect_timer_callback);
-    if (s_connect_timer == NULL) {
-        ESP_LOGE(TAG, "Failed to create connection timeout timer");
-        return ESP_FAIL;
-    }
-    xTimerStart(s_connect_timer, 0);
-
-    EventBits_t bits = xEventGroupWaitBits(s_connect_event_group, CONNECTED_BITS, pdTRUE, pdTRUE, portMAX_DELAY);
+    EventBits_t bits = xEventGroupWaitBits(s_connect_event_group, CONNECTED_BITS, pdTRUE, pdTRUE, pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
     if (bits & CONNECTED_BITS) {
-        // Stop the timer since we successfully connected
-        xTimerStop(s_connect_timer, 0);
         ESP_LOGI(TAG, "Connected to %s", s_connection_name);
         ESP_LOGI(TAG, "IPv4 address: " IPSTR, IP2STR(&s_ip_addr));
         
@@ -145,12 +121,14 @@ esp_err_t wifi_connect(const char *ssid, const char *passwd) {
         //if ( Quarke_Partition_State )
 		    //xTaskCreate(&Quarke_Update_task, "Quarke_Update_task", 2*8192, NULL, 5, &Quarke_Update_Task_xHandle);
         return ESP_OK;
-    } else {
-        ESP_LOGE(TAG, "Failed to connect to Wi-Fi within timeout period");
-        // Stop the timer if the connection failed
-        xTimerStop(s_connect_timer, 0);
-        return ESP_FAIL;
     }
+
+    ESP_LOGE(TAG, "Failed to connect to Wi-Fi within timeout period");
+    stop();
+    vEventGroupDelete(s_connect_event_group);
+    s_connect_event_group = NULL;
+    s_connection_name = NULL;
+    return ESP_ERR_TIMEOUT;
 }
 
 
@@ -167,6 +145,9 @@ esp_err_t wifi_disconnect(void) {
 }
 
 static void on_wifi_disconnect(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+    (void)arg;
+    (void)event_base;
+    (void)event_id;
     wifi_event_sta_disconnected_t* event = (wifi_event_sta_disconnected_t*) event_data;
     ESP_LOGI(TAG, "Wi-Fi disconnected, reason: %d", event->reason);
     
@@ -181,56 +162,123 @@ static void on_wifi_disconnect(void *arg, esp_event_base_t event_base, int32_t e
         ESP_LOGW(TAG, "Wi-Fi not started");
         return;
     }
-    ESP_ERROR_CHECK(err);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_connect retry failed: %s", esp_err_to_name(err));
+    }
 }
 
-static void start(const char *ssid, const char *passwd) {
+static esp_err_t start(const char *ssid, const char *passwd) {
+    esp_err_t err;
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    err = esp_wifi_init(&cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_init failed: %s", esp_err_to_name(err));
+        return err;
+    }
 
     esp_netif_config_t netif_config = ESP_NETIF_DEFAULT_WIFI_STA();
 
     esp_netif_t *netif = esp_netif_new(&netif_config);
+    if (netif == NULL) {
+        ESP_LOGE(TAG, "esp_netif_new failed");
+        return ESP_ERR_NO_MEM;
+    }
 
-    assert(netif);
+    err = esp_netif_attach_wifi_station(netif);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_netif_attach_wifi_station failed: %s", esp_err_to_name(err));
+        esp_netif_destroy(netif);
+        return err;
+    }
 
-    esp_netif_attach_wifi_station(netif);
-    esp_wifi_set_default_wifi_sta_handlers();
+    err = esp_wifi_set_default_wifi_sta_handlers();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_set_default_wifi_sta_handlers failed: %s", esp_err_to_name(err));
+        esp_netif_destroy(netif);
+        return err;
+    }
 
     s_wifi_esp_netif = netif;
 
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &on_wifi_disconnect, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &on_got_ip, NULL));
-    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    err = esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &on_wifi_disconnect, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "register WIFI_EVENT handler failed: %s", esp_err_to_name(err));
+        stop();
+        return err;
+    }
+    err = esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &on_got_ip, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "register IP_EVENT handler failed: %s", esp_err_to_name(err));
+        stop();
+        return err;
+    }
+    err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_set_storage failed: %s", esp_err_to_name(err));
+        stop();
+        return err;
+    }
 
     wifi_config_t wifi_config;
     memset(&wifi_config, 0, sizeof(wifi_config));
     if (ssid) {
-        strncpy((char *)wifi_config.sta.ssid, ssid, strlen(ssid));
+        strlcpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
     }
     if (passwd) {
-        strncpy((char *)wifi_config.sta.password, passwd, strlen(passwd));
+        strlcpy((char *)wifi_config.sta.password, passwd, sizeof(wifi_config.sta.password));
     }
 
     ESP_LOGI(TAG, "Connecting to %s...", wifi_config.sta.ssid);
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    esp_wifi_connect();
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_set_mode failed: %s", esp_err_to_name(err));
+        stop();
+        return err;
+    }
+    err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_set_config failed: %s", esp_err_to_name(err));
+        stop();
+        return err;
+    }
+    err = esp_wifi_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(err));
+        stop();
+        return err;
+    }
+    err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
+        stop();
+        return err;
+    }
     s_connection_name = ssid;
+    return ESP_OK;
 }
 
 static void stop(void) {
-    ESP_ERROR_CHECK(esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &on_wifi_disconnect));
-    ESP_ERROR_CHECK(esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &on_got_ip));
+    (void)esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &on_wifi_disconnect);
+    (void)esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &on_got_ip);
+
     esp_err_t err = esp_wifi_stop();
-    if (err == ESP_ERR_WIFI_NOT_INIT) {
-        return;
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_INIT) {
+        ESP_LOGW(TAG, "esp_wifi_stop failed: %s", esp_err_to_name(err));
     }
-    ESP_ERROR_CHECK(err);
-    ESP_ERROR_CHECK(esp_wifi_deinit());
-    ESP_ERROR_CHECK(esp_wifi_clear_default_wifi_driver_and_handlers(s_wifi_esp_netif));
-    esp_netif_destroy(s_wifi_esp_netif);
+
+    err = esp_wifi_deinit();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_INIT) {
+        ESP_LOGW(TAG, "esp_wifi_deinit failed: %s", esp_err_to_name(err));
+    }
+
+    if (s_wifi_esp_netif != NULL) {
+        err = esp_wifi_clear_default_wifi_driver_and_handlers(s_wifi_esp_netif);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "esp_wifi_clear_default_wifi_driver_and_handlers failed: %s", esp_err_to_name(err));
+        }
+        esp_netif_destroy(s_wifi_esp_netif);
+    }
+
     s_wifi_esp_netif = NULL;
 }
 
