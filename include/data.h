@@ -24,7 +24,7 @@
 #define POS_BIT_MAX_RH                    9
 #define POS_BIT_MAX_CO2                  10
 #define POS_BIT_MAX_VOC                  11
-#define POS_BIT_QRK_UPDATE               14  //  bit[14]: Quarke update fro WBM availlable
+#define POS_BIT_QRK_UPDATE               14  //  bit[14]: Quark update fro WBM availlable
 // dal bit 12 al bit 15  * LIBERI *
 
 //------------- Indici Accessori con uscita digitale (bus I2C) -------------

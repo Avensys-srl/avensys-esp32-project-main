@@ -118,8 +118,8 @@ esp_err_t wifi_connect(const char *ssid, const char *passwd) {
         
         // Start the firmware update task
         xTaskCreate(&check_update_task, "check_update_task", 8192, NULL, 5, NULL);
-        //if ( Quarke_Partition_State )
-		    //xTaskCreate(&Quarke_Update_task, "Quarke_Update_task", 2*8192, NULL, 5, &Quarke_Update_Task_xHandle);
+        //if ( partition update is enabled )
+		    //xTaskCreate(&update_task, "Quark_Update_task", 2*8192, NULL, 5, &update_task_handle);
         return ESP_OK;
     }
 

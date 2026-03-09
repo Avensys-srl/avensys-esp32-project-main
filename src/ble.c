@@ -43,6 +43,9 @@ static uint8_t s_prov_status_value = 0;
 static bool s_prov_status_notify = false;
 static uint16_t s_conn_id = 0;
 static esp_gatt_if_t s_gatts_if = ESP_GATT_IF_NONE;
+static uint8_t s_eeprom_stream_buf[PREPARE_BUF_MAX_SIZE];
+static size_t s_eeprom_stream_len = 0;
+static TickType_t s_eeprom_stream_last_tick = 0;
 
 #define BLE_PROVISION_TIMEOUT_MS 90000
 
@@ -53,6 +56,7 @@ static esp_gatt_if_t s_gatts_if = ESP_GATT_IF_NONE;
 #define PROV_STATE_APPLYING      4
 #define PROV_STATE_DONE          5
 #define PROV_STATE_ERROR         6
+#define EEPROM_STREAM_TIMEOUT_MS 1500
 
 static void ble_reset_credential_packets(void);
 static bool ble_packet_append(ble_packet_t *packet, const uint8_t *data, size_t len, size_t max_len, const char *label);
@@ -62,6 +66,7 @@ static void ble_restart_provision_timer(void);
 static void ble_stop_provision_timer(void);
 static void ble_security_init(void);
 static void ble_set_provision_status(uint8_t status);
+static bool ble_apply_eeprom_payload(const uint8_t *payload, size_t payload_len, const char *source);
 
 static bool ble_packet_append(ble_packet_t *packet, const uint8_t *data, size_t len, size_t max_len, const char *label) {
     if (packet->data == NULL) {
@@ -193,6 +198,26 @@ static void ble_security_init(void) {
     (void)esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, sizeof(key_size));
     (void)esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, sizeof(init_key));
     (void)esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &resp_key, sizeof(resp_key));
+}
+
+static bool ble_apply_eeprom_payload(const uint8_t *payload, size_t payload_len, const char *source) {
+    size_t required_len = sizeof(gRDEeprom);
+    if (payload == NULL || payload_len < required_len) {
+        ESP_LOGW(GATTS_TABLE_TAG, "EEPROM write ignored (%s): payload too short (%d < %d)",
+                 source, (int)payload_len, (int)required_len);
+        return false;
+    }
+
+    memcpy(&gRDEeprom, payload, required_len);
+    ESP_LOGI(GATTS_TABLE_TAG, "EEPROM write accepted from %s, len=%d", source, (int)payload_len);
+
+    Read_Eeprom_Request_Index |= 0x800;
+    Read_Eeprom_Request_Index |= 0x1000;
+    Read_Eeprom_Request_Index |= 0x2000;
+    Read_Eeprom_Request_Index |= 0x4000;
+    Read_Eeprom_Request_Index |= 0x8000;
+    ESP_LOGI(GATTS_TABLE_TAG, "EEPROM write request queued");
+    return true;
 }
 
 static uint8_t service_uuid[16] = {
@@ -581,14 +606,7 @@ void exec_write_event_env(prepare_type_env_t *prepare_write_env, esp_ble_gatts_c
     if (param->exec_write.exec_write_flag == ESP_GATT_PREP_WRITE_EXEC && prepare_write_env->prepare_buf) {
         esp_log_buffer_hex(GATTS_TABLE_TAG, prepare_write_env->prepare_buf, prepare_write_env->prepare_len);
          ESP_LOGI(GATTS_TABLE_TAG, "Lenght : %d", prepare_write_env->prepare_len);
-         memcpy(&gRDEeprom, prepare_write_env->prepare_buf, sizeof(gRDEeprom));
-         ESP_LOGI(GATTS_TABLE_TAG, "Speed : %d", gRDEeprom.sel_idxStepMotors);
-         Read_Eeprom_Request_Index |= 0x800;
-         Read_Eeprom_Request_Index |= 0x1000;
-         Read_Eeprom_Request_Index |= 0x2000;
-         Read_Eeprom_Request_Index |= 0x4000;
-         Read_Eeprom_Request_Index |= 0x8000;
-         ESP_LOGI(GATTS_TABLE_TAG, "Invio scrittura completata");
+         (void)ble_apply_eeprom_payload(prepare_write_env->prepare_buf, prepare_write_env->prepare_len, "prepare-write");
         
     } else {
         ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATT_PREP_WRITE_CANCEL");
@@ -644,7 +662,36 @@ case ESP_GATTS_WRITE_EVT:
                 ESP_LOGI(GATTS_TABLE_TAG, "GATT_WRITE_EVT, handle = %d, value len = %d", param->write.handle, param->write.len);
                 esp_log_buffer_hex(GATTS_TABLE_TAG, param->write.value, param->write.len);
 
-                if (param->write.handle == ble_handle_table[IDX_CHAR_VAL_WIFI_SSID]) {
+                if (param->write.handle == ble_handle_table[IDX_CHAR_VAL_EEPROM_DATA]) {
+                    TickType_t now = xTaskGetTickCount();
+                    if (s_eeprom_stream_len > 0 &&
+                        (now - s_eeprom_stream_last_tick) > pdMS_TO_TICKS(EEPROM_STREAM_TIMEOUT_MS)) {
+                        ESP_LOGW(GATTS_TABLE_TAG, "EEPROM stream timeout, resetting partial buffer (%d bytes)", (int)s_eeprom_stream_len);
+                        s_eeprom_stream_len = 0;
+                    }
+
+                    s_eeprom_stream_last_tick = now;
+
+                    if (param->write.len >= sizeof(gRDEeprom)) {
+                        (void)ble_apply_eeprom_payload(param->write.value, param->write.len, "write-direct");
+                        s_eeprom_stream_len = 0;
+                    } else {
+                        if ((s_eeprom_stream_len + param->write.len) > sizeof(s_eeprom_stream_buf)) {
+                            ESP_LOGE(GATTS_TABLE_TAG, "EEPROM stream overflow (%d + %d), dropping stream",
+                                     (int)s_eeprom_stream_len, param->write.len);
+                            s_eeprom_stream_len = 0;
+                        } else {
+                            memcpy(s_eeprom_stream_buf + s_eeprom_stream_len, param->write.value, param->write.len);
+                            s_eeprom_stream_len += param->write.len;
+                            ESP_LOGI(GATTS_TABLE_TAG, "EEPROM stream chunk received, total=%d", (int)s_eeprom_stream_len);
+
+                            if (s_eeprom_stream_len >= sizeof(gRDEeprom)) {
+                                (void)ble_apply_eeprom_payload(s_eeprom_stream_buf, s_eeprom_stream_len, "write-stream");
+                                s_eeprom_stream_len = 0;
+                            }
+                        }
+                    }
+                } else if (param->write.handle == ble_handle_table[IDX_CHAR_VAL_WIFI_SSID]) {
                     ESP_LOGI(GATTS_TABLE_TAG, "WIFI SSID");
                     ble_restart_provision_timer();
 
@@ -757,6 +804,7 @@ case ESP_GATTS_WRITE_EVT:
             ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATTS_DISCONNECT_EVT, reason = 0x%x", param->disconnect.reason);
             ble_stop_provision_timer();
             ble_reset_credential_packets();
+            s_eeprom_stream_len = 0;
             wifi_is_ssid_send = false;
             wifi_is_pass_send = false;
             connect_to_wifi = false;

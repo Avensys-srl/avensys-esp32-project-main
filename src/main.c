@@ -12,8 +12,8 @@
 #define VERSION_URL "https://mybestdocument.altervista.org/ESP32/version.json"
 #define BUFFSIZE 1024
 
-//#define Quarke_URL "https://www.alsaqr.io/.well-known/publicFIleTest/T533422LK/File1.bin"
-//#define Quarke_URL "https://dl.espressif.com/dl/esp-idf/ci/esp_http_client_demo.txt"
+//#define Quark_URL "https://www.alsaqr.io/.well-known/publicFIleTest/T533422LK/File1.bin"
+//#define Quark_URL "https://dl.espressif.com/dl/esp-idf/ci/esp_http_client_demo.txt"
 #define Quarke_URL "https://www.avensys-srl.com/ESP32/Quarke_Main.bin"
 
 
@@ -56,10 +56,10 @@ static const char *TAG1 = "Main Task : ";
 volatile uint32_t millis_tick = 0;
 
 TaskHandle_t Quarke_Task_xHandle = NULL;
-static const char *TAG3 = "Quarke Task : ";
+static const char *TAG3 = "Quark Task : ";
 bool Quarke_Partition_State = false;
 TaskHandle_t Quarke_Update_Task_xHandle = NULL;
-static const char *TAG_QRK_UPDATE =  "Quarke Update : ";
+static const char *TAG_QRK_UPDATE =  "Quark Update : ";
 bool File_opened = false;
 FILE* f = NULL;
 char Buffer_Test[1536];
@@ -226,7 +226,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
             is_mqtt_ready = true;
 			if (( Quarke_Partition_State ) && (!Quarke_Update_task_Flag) && (!Bootloader_State_Flag) )
-		    	xTaskCreate(&Quarke_Update_task, "Quarke_Update_task", 2*8192, NULL, 5, &Quarke_Update_Task_xHandle);
+		    	xTaskCreate(&Quarke_Update_task, "Quark_Update_task", 2*8192, NULL, 5, &Quarke_Update_Task_xHandle);
             break;
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGI(GATTS_TABLE_TAG, "MQTT_EVENT_DISCONNECTED");
@@ -288,7 +288,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 ESP_LOGI(GATTS_TABLE_TAG, "Last errno string (%s)", strerror(event->error_handle->esp_transport_sock_errno));
             }
 			if (( Quarke_Partition_State ) && (!Quarke_Update_task_Flag) && (!Bootloader_State_Flag) )
-		    	xTaskCreate(&Quarke_Update_task, "Quarke_Update_task", 2*8192, NULL, 5, &Quarke_Update_Task_xHandle);
+		    	xTaskCreate(&Quarke_Update_task, "Quark_Update_task", 2*8192, NULL, 5, &Quarke_Update_Task_xHandle);
             break;
         default:
             ESP_LOGI(GATTS_TABLE_TAG, "Other event id:%d", event->event_id);
@@ -476,7 +476,7 @@ static esp_err_t _http1_event_handler(esp_http_client_event_t *evt)
 								Load_Counter = 0;
 								Firmware_version = 0;
 								Firmware_version_server = 0;
-								ESP_LOGI(TAG_QRK_UPDATE, "No update needed , keep the same firmware on Quarke Board");
+								ESP_LOGI(TAG_QRK_UPDATE, "No update needed , keep the same firmware on Quark Board");
 							}
 						else // the version is not the same update will be done
 							{
@@ -626,7 +626,7 @@ void check_update_task(void *pvParameter) {
 void Quarke_Update_task (void *pvParameters)
 {
 
-    ESP_LOGI(TAG_QRK_UPDATE, "Checking for Quarke firmware");
+    ESP_LOGI(TAG_QRK_UPDATE, "Checking for Quark firmware");
 
 	Quarke_Update_task_Flag = true;
 
@@ -782,7 +782,7 @@ static void Quarke_event_task(void *pvParameters)
 	uint8_t       *debug_data;
     uint8_t       *polling_data;
 
-	ESP_LOGI(TAG3, "Quarke Task Started");
+	ESP_LOGI(TAG3, "Quark Task Started");
 
     for (;;) {
 
@@ -802,11 +802,11 @@ static void Quarke_event_task(void *pvParameters)
 			
 			case WBM_Connected:
 
-				if ( Quarke_Update_Counter >= 86400000 ) // 24 hours to check new quarke board firmware on server
+				if ( Quarke_Update_Counter >= 86400000 ) // 24 hours to check new quark board firmware on server
 				{
 					Quarke_Update_Counter = 0;
 					if (( Quarke_Partition_State ) && (!Quarke_Update_task_Flag) && (!Bootloader_State_Flag))
-		    				xTaskCreate(&Quarke_Update_task, "Quarke_Update_task", 2*8192, NULL, 5, &Quarke_Update_Task_xHandle);
+		    				xTaskCreate(&Quarke_Update_task, "Quark_Update_task", 2*8192, NULL, 5, &Quarke_Update_Task_xHandle);
 				}
 
 				if ( Millis() < gKTSGlobal.LastReceivedPollingBase_TimerMilliseconds)
@@ -849,7 +849,7 @@ static void Quarke_event_task(void *pvParameters)
 				
 				if (((Millis() - globalTimeoutMilliseconds) >= TimeoutMilliseconds) || (Millis() < globalTimeoutMilliseconds))
 					{
-						WBM_Com_State = WBM_Error ; // no connection with Quarke board after Timeout
+						WBM_Com_State = WBM_Error ; // no connection with Quark board after Timeout
 						retriesCounter = 0;
 						Eeprom_Data_received = false;
 						Read_Eeprom_Request_Index = 0;
@@ -1247,8 +1247,8 @@ void app_main(void) {
 
    vTaskDelay(100 );
 
-   //Create a task to handle Data comming from Quarke Board
-   xTaskCreate(Quarke_event_task, "Quarke_event_task", 2*2048, NULL, 2, &Quarke_Task_xHandle);
+   //Create a task to handle Data comming from Quark Board
+   xTaskCreate(Quarke_event_task, "Quark_event_task", 2*2048, NULL, 2, &Quarke_Task_xHandle);
 }
 
 uint32_t Millis ( void )
@@ -1277,13 +1277,13 @@ void Connect_To_QRK ( void )
 			}
 			currentState = CLKTSConnectState_TrySerialLink;
 			break;
-		case CLKTSConnectState_TrySerialLink: // wait response from Quarke Board
+		case CLKTSConnectState_TrySerialLink: // wait response from Quark Board
 			
 			if (((Millis() - globalTimeoutMilliseconds) >= TimeoutMilliseconds) || (Millis() < globalTimeoutMilliseconds))
 				{
 					if ( retriesCounter == 2 )
 					{
-							WBM_Com_State = WBM_Error ; // no connection with Quarke board after Timeout
+							WBM_Com_State = WBM_Error ; // no connection with Quark board after Timeout
 							retriesCounter = 0;
 					}
 					else
@@ -1317,7 +1317,7 @@ void Connect_To_QRK ( void )
 		case CLKTSConnectState_ReadEeprom_Info:
 			if (((Millis() - globalTimeoutMilliseconds) >= TimeoutMilliseconds) || (Millis() < globalTimeoutMilliseconds))
 				{
-					WBM_Com_State = WBM_Error ; // no connection with Quarke board after Timeout
+					WBM_Com_State = WBM_Error ; // no connection with Quark board after Timeout
 					retriesCounter = 0;
 				}
 			else
@@ -1339,7 +1339,7 @@ void Connect_To_QRK ( void )
 		case CLKTSConnectState_ReadEeprom_Configuration:
 			 if (((Millis() - globalTimeoutMilliseconds) >= TimeoutMilliseconds) || (Millis() < globalTimeoutMilliseconds))
 				{
-					WBM_Com_State = WBM_Error ; // no connection with Quarke board after Timeout
+					WBM_Com_State = WBM_Error ; // no connection with Quark board after Timeout
 					retriesCounter = 0;
 				}
 			else
@@ -1361,7 +1361,7 @@ void Connect_To_QRK ( void )
 		case CLKTSConnectState_ReadEeprom_SettingPar:
 			 if (((Millis() - globalTimeoutMilliseconds) >= TimeoutMilliseconds) || (Millis() < globalTimeoutMilliseconds))
 				{
-					WBM_Com_State = WBM_Error ; // no connection with Quarke board after Timeout
+					WBM_Com_State = WBM_Error ; // no connection with Quark board after Timeout
 					retriesCounter = 0;
 				}
 			else
@@ -1383,7 +1383,7 @@ void Connect_To_QRK ( void )
 		case CLKTSConnectState_ReadEeprom_SetTemp:
 			if (((Millis() - globalTimeoutMilliseconds) >= TimeoutMilliseconds) || (Millis() < globalTimeoutMilliseconds))
 				{
-					WBM_Com_State = WBM_Error ; // no connection with Quarke board after Timeout
+					WBM_Com_State = WBM_Error ; // no connection with Quark board after Timeout
 					retriesCounter = 0;
 				}
 			else
@@ -1405,7 +1405,7 @@ void Connect_To_QRK ( void )
 		case CLKTSConnectState_ReadEeprom_DayProg:
 			if (((Millis() - globalTimeoutMilliseconds) >= TimeoutMilliseconds) || (Millis() < globalTimeoutMilliseconds))
 				{
-					WBM_Com_State = WBM_Error ; // no connection with Quarke board after Timeout
+					WBM_Com_State = WBM_Error ; // no connection with Quark board after Timeout
 					retriesCounter = 0;
 				}
 			else
@@ -1427,7 +1427,7 @@ void Connect_To_QRK ( void )
 		case CLKTSConnectState_ReadEeprom_HWSetting:
 			if (((Millis() - globalTimeoutMilliseconds) >= TimeoutMilliseconds) || (Millis() < globalTimeoutMilliseconds))
 				{
-					WBM_Com_State = WBM_Error ; // no connection with Quarke board after Timeout
+					WBM_Com_State = WBM_Error ; // no connection with Quark board after Timeout
 					retriesCounter = 0;
 				}
 			else
@@ -1449,7 +1449,7 @@ void Connect_To_QRK ( void )
 		case CLKTSConnectState_PollingBase:
 			if (((Millis() - globalTimeoutMilliseconds) >= TimeoutMilliseconds) || (Millis() < globalTimeoutMilliseconds))
 				{
-					WBM_Com_State = WBM_Error ; // no connection with Quarke board after Timeout
+					WBM_Com_State = WBM_Error ; // no connection with Quark board after Timeout
 					retriesCounter = 0;
 				}
 			else
@@ -1474,7 +1474,7 @@ void Connect_To_QRK ( void )
 			gKTSGlobal.PollingDebugData_TimerMilliseconds	= gKTSGlobal.PollingBase_TimerMilliseconds;
 			WBM_Com_State = WBM_Connected ;
 			WBM_Polling_Base_Data_Parse ( buff_ser1 );
-            ESP_LOGI(TAG1, "WBM connected to Quarke" );
+            ESP_LOGI(TAG1, "WBM connected to Quark" );
 			esp_ble_gatts_set_attr_value(ble_handle_table[IDX_CHAR_VAL_EEPROM_DATA], sizeof(gRDEeprom), (u_int8_t *)&gRDEeprom);
 			if (is_mqtt_ready) {
 			// Publish EEPROM Data to the App via MQTT
@@ -1484,7 +1484,7 @@ void Connect_To_QRK ( void )
 			break;
 
 		case Bootloader_State:
-			if ( !Quarke_Update_task_Flag ) // check if we are not in quarke firmware update task
+			if ( !Quarke_Update_task_Flag ) // check if we are not in quark firmware update task
 			{
 				Bootloader_State_Flag = true; // here we are in bootloader upgrade mode, so no update is allowed from server
 				vTaskDelay(5);
