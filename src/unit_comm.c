@@ -7,6 +7,8 @@
 
 static const char *TAG1 = "Main Task : ";
 static const char *TAG3 = "Unit Task : ";
+#define BLE_POLLING_MIN_LEN 40
+#define BLE_DEBUG_MIN_LEN 48
 
 TaskHandle_t Unit_Task_xHandle = NULL;
 
@@ -175,7 +177,15 @@ static void Unit_event_task(void *pvParameters)
                                 mqtt_publish_polling(address, polling_data, polling_data_len);
 							}
 							
-							esp_ble_gatts_set_attr_value(ble_handle_table[IDX_CHAR_VAL_POLLIING], polling_data_len, polling_data);
+							if (polling_data_len < BLE_POLLING_MIN_LEN) {
+								uint8_t polling_compat[BLE_POLLING_MIN_LEN] = {0};
+								memcpy(polling_compat, polling_data, polling_data_len);
+								esp_ble_gatts_set_attr_value(ble_handle_table[IDX_CHAR_VAL_POLLIING], BLE_POLLING_MIN_LEN, polling_compat);
+								ESP_LOGW(TAG1, "Polling payload short (%u), padded to %u for BLE app compatibility",
+								         (unsigned)polling_data_len, (unsigned)BLE_POLLING_MIN_LEN);
+							} else {
+								esp_ble_gatts_set_attr_value(ble_handle_table[IDX_CHAR_VAL_POLLIING], polling_data_len, polling_data);
+							}
 							WBM_Polling_Base_Data_Parse ( buff_ser1 );
 							Eeprom_Data_received = false;
 							ESP_LOGI(TAG1, "Polling Data Received" );
@@ -195,7 +205,15 @@ static void Unit_event_task(void *pvParameters)
                                         mqtt_publish_debug(address, debug_data, debug_data_len);
 									}
 
-									esp_ble_gatts_set_attr_value(ble_handle_table[IDX_CHAR_VAL_DEBUG_DATA], debug_data_len, debug_data);
+									if (debug_data_len < BLE_DEBUG_MIN_LEN) {
+										uint8_t debug_compat[BLE_DEBUG_MIN_LEN] = {0};
+										memcpy(debug_compat, debug_data, debug_data_len);
+										esp_ble_gatts_set_attr_value(ble_handle_table[IDX_CHAR_VAL_DEBUG_DATA], BLE_DEBUG_MIN_LEN, debug_compat);
+										ESP_LOGW(TAG1, "Debug payload short (%u), padded to %u for BLE app compatibility",
+										         (unsigned)debug_data_len, (unsigned)BLE_DEBUG_MIN_LEN);
+									} else {
+										esp_ble_gatts_set_attr_value(ble_handle_table[IDX_CHAR_VAL_DEBUG_DATA], debug_data_len, debug_data);
+									}
 									WBM_Debug_Data_Parse ( buff_ser1 );
 									Eeprom_Data_received = false;
 									ESP_LOGI(TAG1, "Debug Data Received" );
@@ -844,11 +862,11 @@ void WBM_Write_Eeprom_Data_Parse ( byte* rxBuffer )
 {
 	if ( rxBuffer[ IRSW_RESULT_W ] == '0') // write OK
 	{
-		ESP_LOGI(TAG1, "Eeprom wrote successfully" );
+		ESP_LOGI(TAG1, "Eeprom wrote successfully (unit ACK=%c)", rxBuffer[IRSW_RESULT_W] );
 	}
 	else
 	{
-		ESP_LOGI(TAG1, "Eeprom writing error" );
+		ESP_LOGW(TAG1, "Eeprom writing error (unit ACK=%c)", rxBuffer[IRSW_RESULT_W] );
 	}
 
 		// Controlla che se il counter update INFO e' maggiore di 1, richiede la rilettura della eeprom

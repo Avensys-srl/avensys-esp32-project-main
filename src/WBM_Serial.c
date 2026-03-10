@@ -2,6 +2,7 @@
 #include "string.h"
 #include "stdlib.h"
 #include <stdio.h>
+#include "esp_log.h"
 #include "protocol_Serial.h"
 #include "definitions.h"
 
@@ -26,6 +27,7 @@ static const uint8_t* s_rx_ptr = NULL;
 
 bool Bootloader_Mode = false;
 bool Ack_Received = false;
+static const char *TAG_SERIAL = "WBM_Serial";
 
 void Serial_begin( void )
 {
@@ -281,6 +283,8 @@ void Com_SendRequest_WriteEeprom( byte startAddress, byte count )
 		txBuffer[ IRQW_ADDR_NUM_BYTE_EEP ]		= count;
 	
 		memcpy( txBuffer + IRQW_START_DATA_EEPROM, ((byte*) (&gRDEeprom)) + startAddress, count );
+
+		ESP_LOGI(TAG_SERIAL, "UART TX COMMAND_WRITE_EEPROM start=%u count=%u", (unsigned)startAddress, (unsigned)count);
 	
 		// Invia la richiesta
 		Write_Message( txBuffer);

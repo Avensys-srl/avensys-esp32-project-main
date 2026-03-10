@@ -27,6 +27,7 @@ uint16_t ble_handle_table[HRS_IDX_NB];
 typedef struct {
     uint8_t *prepare_buf;
     int      prepare_len;
+    uint16_t prepare_handle;
 } prepare_type_env_t;
 
 // Struttura per memorizzare i dati del pacchetto BLE
@@ -62,9 +63,13 @@ static TimerHandle_t s_prov_timer = NULL;
 static bool s_runtime_ready = false;
 
 #define PROV_TIMEOUT_MS 90000
+#define BLE_POLLING_MIN_LEN 40
+#define BLE_DEBUG_MIN_LEN 48
 
 static void ble_set_prov_status(uint8_t status);
 static void ble_init_runtime_placeholders(void);
+static void ble_schedule_full_eeprom_write(const char *source);
+static bool ble_apply_legacy242_eeprom(const uint8_t *legacy, size_t legacy_len);
 
 static bool ble_packet_append(ble_packet_t *packet, const uint8_t *data, size_t len, size_t max_len, const char *label) {
     if (packet->data == NULL) {
@@ -126,6 +131,38 @@ static void ble_packet_copy_to_string(const ble_packet_t *packet, char *out, siz
     out[copy_len] = '\0';
 }
 
+static void ble_schedule_full_eeprom_write(const char *source) {
+    Read_Eeprom_Request_Index |= 0x800;
+    Read_Eeprom_Request_Index |= 0x1000;
+    Read_Eeprom_Request_Index |= 0x2000;
+    Read_Eeprom_Request_Index |= 0x4000;
+    Read_Eeprom_Request_Index |= 0x8000;
+    ESP_LOGI(GATTS_TABLE_TAG, "EEPROM write scheduled from %s, flags=0x%04X", source, Read_Eeprom_Request_Index);
+}
+
+// Convert legacy 242-byte EEPROM payload to firmware 241-byte layout.
+static bool ble_apply_legacy242_eeprom(const uint8_t *legacy, size_t legacy_len) {
+    if (legacy == NULL || legacy_len != (sizeof(gRDEeprom) + 1)) {
+        return false;
+    }
+
+    uint8_t *dst = (uint8_t *)&gRDEeprom;
+
+    memset(dst, 0, sizeof(gRDEeprom));
+    memcpy(dst, legacy, 126);
+    dst[126] = legacy[128];
+    memcpy(dst + 127, legacy + 129, 6);
+    memcpy(dst + 133, legacy + 135, 19);
+    dst[152] = legacy[154];
+    memcpy(dst + 153, legacy + 155, 84);
+    dst[237] = legacy[239];
+    dst[238] = legacy[241];
+    dst[239] = legacy[240];
+    dst[240] = 0;
+
+    return true;
+}
+
 static void ble_prov_timeout_callback(TimerHandle_t xTimer);
 
 static void ble_prov_timer_reset(void) {
@@ -183,13 +220,17 @@ bool ble_is_runtime_ready(void) {
 }
 
 static void ble_init_runtime_placeholders(void) {
+    static uint8_t s_polling_placeholder[BLE_POLLING_MIN_LEN] = {0};
+    static uint8_t s_debug_placeholder[BLE_DEBUG_MIN_LEN] = {0};
+
     memset(&gRDEeprom, 0, sizeof(gRDEeprom));
     memset(&gKTSData, 0, sizeof(gKTSData));
     memset(&gKTSDebugData, 0, sizeof(gKTSDebugData));
 
     esp_ble_gatts_set_attr_value(ble_handle_table[IDX_CHAR_VAL_EEPROM_DATA], sizeof(gRDEeprom), (uint8_t *)&gRDEeprom);
-    esp_ble_gatts_set_attr_value(ble_handle_table[IDX_CHAR_VAL_POLLIING], sizeof(gKTSData), (uint8_t *)&gKTSData);
-    esp_ble_gatts_set_attr_value(ble_handle_table[IDX_CHAR_VAL_DEBUG_DATA], sizeof(gKTSDebugData), (uint8_t *)&gKTSDebugData);
+    // Keep BLE payloads compatible with app parser minimum lengths from first read.
+    esp_ble_gatts_set_attr_value(ble_handle_table[IDX_CHAR_VAL_POLLIING], sizeof(s_polling_placeholder), s_polling_placeholder);
+    esp_ble_gatts_set_attr_value(ble_handle_table[IDX_CHAR_VAL_DEBUG_DATA], sizeof(s_debug_placeholder), s_debug_placeholder);
 }
 
 static uint8_t service_uuid[16] = {
@@ -480,7 +521,19 @@ static void ble_security_init(void) {
 
 static void handle_write_event(esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param) {
     ble_prov_timer_reset();
-    if (param->write.handle == ble_handle_table[IDX_CHAR_VAL_WIFI_SSID]) {
+    if (param->write.handle == ble_handle_table[IDX_CHAR_VAL_EEPROM_DATA]) {
+        if (param->write.len == sizeof(gRDEeprom)) {
+            memcpy(&gRDEeprom, param->write.value, sizeof(gRDEeprom));
+            esp_ble_gatts_set_attr_value(ble_handle_table[IDX_CHAR_VAL_EEPROM_DATA], sizeof(gRDEeprom), (uint8_t *)&gRDEeprom);
+            ble_schedule_full_eeprom_write("write-direct");
+        } else if (ble_apply_legacy242_eeprom(param->write.value, param->write.len)) {
+            esp_ble_gatts_set_attr_value(ble_handle_table[IDX_CHAR_VAL_EEPROM_DATA], sizeof(gRDEeprom), (uint8_t *)&gRDEeprom);
+            ble_schedule_full_eeprom_write("write-legacy242");
+        } else {
+            ESP_LOGW(GATTS_TABLE_TAG, "Unsupported EEPROM write len=%u (expected %u or %u)",
+                     (unsigned)param->write.len, (unsigned)sizeof(gRDEeprom), (unsigned)(sizeof(gRDEeprom) + 1));
+        }
+    } else if (param->write.handle == ble_handle_table[IDX_CHAR_VAL_WIFI_SSID]) {
         ESP_LOGI(GATTS_TABLE_TAG, "WIFI SSID");
 
         if (!ble_packet_append(&ssid_packet, param->write.value, param->write.len, MAX_SSID_LENGTH, "SSID")) {
@@ -588,6 +641,7 @@ static void prepare_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t *
     if (prepare_write_env->prepare_buf == NULL) {
         prepare_write_env->prepare_buf = (uint8_t *)malloc(PREPARE_BUF_MAX_SIZE * sizeof(uint8_t));
         prepare_write_env->prepare_len = 0;
+        prepare_write_env->prepare_handle = param->write.handle;
         if (prepare_write_env->prepare_buf == NULL) {
             ESP_LOGE(GATTS_TABLE_TAG, "%s, Gatt_server prep no mem", __func__);
             status = ESP_GATT_NO_RESOURCES;
@@ -629,15 +683,19 @@ static void exec_write_event_env(prepare_type_env_t *prepare_write_env, esp_ble_
     if (param->exec_write.exec_write_flag == ESP_GATT_PREP_WRITE_EXEC && prepare_write_env->prepare_buf) {
         esp_log_buffer_hex(GATTS_TABLE_TAG, prepare_write_env->prepare_buf, prepare_write_env->prepare_len);
          ESP_LOGI(GATTS_TABLE_TAG, "Lenght : %d", prepare_write_env->prepare_len);
-         memcpy(&gRDEeprom, prepare_write_env->prepare_buf, sizeof(gRDEeprom));
-         ESP_LOGI(GATTS_TABLE_TAG, "Speed : %d", gRDEeprom.sel_idxStepMotors);
-         Read_Eeprom_Request_Index |= 0x800;
-         Read_Eeprom_Request_Index |= 0x1000;
-         Read_Eeprom_Request_Index |= 0x2000;
-         Read_Eeprom_Request_Index |= 0x4000;
-         Read_Eeprom_Request_Index |= 0x8000;
-         ESP_LOGI(GATTS_TABLE_TAG, "Invio scrittura completata");
-        
+         if (prepare_write_env->prepare_handle == ble_handle_table[IDX_CHAR_VAL_EEPROM_DATA]) {
+             if (prepare_write_env->prepare_len >= (int)sizeof(gRDEeprom)) {
+                 memcpy(&gRDEeprom, prepare_write_env->prepare_buf, sizeof(gRDEeprom));
+                 esp_ble_gatts_set_attr_value(ble_handle_table[IDX_CHAR_VAL_EEPROM_DATA], sizeof(gRDEeprom), (uint8_t *)&gRDEeprom);
+                 ESP_LOGI(GATTS_TABLE_TAG, "Speed : %d", gRDEeprom.sel_idxStepMotors);
+                 ble_schedule_full_eeprom_write("prepare-write");
+                 ESP_LOGI(GATTS_TABLE_TAG, "Invio scrittura completata");
+             } else {
+                 ESP_LOGW(GATTS_TABLE_TAG, "Prepare EEPROM len too short: %d", prepare_write_env->prepare_len);
+             }
+         } else {
+             ESP_LOGI(GATTS_TABLE_TAG, "Prepare/exec ignored for handle=%u", prepare_write_env->prepare_handle);
+         }
     } else {
         ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATT_PREP_WRITE_CANCEL");
     }
@@ -646,6 +704,7 @@ static void exec_write_event_env(prepare_type_env_t *prepare_write_env, esp_ble_
         prepare_write_env->prepare_buf = NULL;
     }
     prepare_write_env->prepare_len = 0;
+    prepare_write_env->prepare_handle = 0;
 }
 
 static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param) {
