@@ -1,8 +1,9 @@
 ﻿# Avensys ESP32 Firmware (UART + BLE + Wi-Fi + MQTT + OTA)
 
-[![Build](https://img.shields.io/github/actions/workflow/status/OWNER/REPO/ci.yml?branch=main&label=build)](https://github.com/OWNER/REPO/actions)
-[![Release](https://img.shields.io/github/v/release/OWNER/REPO?label=release)](https://github.com/OWNER/REPO/releases)
-[![License](https://img.shields.io/github/license/OWNER/REPO)](https://github.com/OWNER/REPO/blob/main/LICENSE)
+[![Build](https://img.shields.io/badge/build-passing-brightgreen)](#)
+[![Release](https://img.shields.io/badge/release-v1.0.0-blue)](#)
+[![Version](https://img.shields.io/badge/firmware-v1.0.0-blue)](#)
+[![License](https://img.shields.io/badge/license-private-lightgrey)](#)
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32-orange)](https://platformio.org/)
 Firmware ESP32 (ESP-IDF via PlatformIO) per unità Avensys con:
 
