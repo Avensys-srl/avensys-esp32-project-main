@@ -142,6 +142,19 @@ enum index_message_resp_data_debug {
    IRSD_MEASURE_TA_COOL_HI,
    IRSD_STATUS_DSC,
 
+   // CAPS - CAPF
+   IRSD_MEASUR_PA_CAPS_LO,                 //
+   IRSD_MEASUR_PA_CAPS_HI,                 //
+   IRSD_MEASUR_PA_CAPR_LO,                 //
+   IRSD_MEASUR_PA_CAPR_HI,                 //
+   IRSD_MEASUR_AF_CAPS_LO,                 //
+   IRSD_MEASUR_AF_CAPS_HI,                 //
+   IRSD_MEASUR_AF_CAPR_LO,                 //
+   IRSD_MEASUR_AF_CAPR_HI,                 //
+   IRSD_LEV_LINK_CAPR,                     // 0/10 Level
+   IRSD_LEV_LINK_CAPS,                     // 0/10 Level
+   IRSD_STATUS_CAPS,                      // 1 byte: status
+   IRSD_STATUS_CAPR,                      // 1 byte: status
    
    IRSD_CRC_LO,                            // byte_42: CRC : Low 
    IRSD_CRC_HI                             // byte_43: CRC : high    
@@ -268,9 +281,6 @@ enum index_message_resp_polling_base {
   IRSP_CNT_UPDATE_EEP_WEEKLY,
   IRSP_MEASURE_AWP_SENS_LO,       // 2 byte:  Temperatura x 10
   IRSP_MEASURE_AWP_SENS_HI,
-  IRSP_BELIMO1_STATE,
-  IRSP_BELIMO2_STATE,
-  IRSP_FIRE_STATE,
 	
   IRSP_CRC_LO,                                  
   IRSP_CRC_HI                                    

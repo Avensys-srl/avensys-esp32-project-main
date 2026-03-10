@@ -10,39 +10,37 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
-#include "freertos/semphr.h"
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "driver/gpio.h"
-#include "esp_intr_alloc.h"
 #include "Uart1.h"
 
-#include "esp32/rom/uart.h"
 #include "main.h"
 
 #define UART1_NUM UART_NUM_1
-#define BUF_SIZE (1024)
-#define RD_BUF_SIZE (BUF_SIZE)
+#define UART1_TX_PIN GPIO_NUM_17
+#define UART1_RX_PIN GPIO_NUM_16
+#define UART1_BUF_SIZE (1024)
+#define UART1_RX_CACHE_SIZE (128)
 
 QueueHandle_t Uart1_Queue;
 TaskHandle_t Uart1_Task_xHandle = NULL;
 
 static const char *TAG2 = "Uart1_Events : ";
-size_t Byte_Available_On_Uart1 = 0;
-uint8_t Buffer_Temp[128];
+static size_t s_rx_available = 0;
+static uint8_t s_rx_cache[UART1_RX_CACHE_SIZE];
 
 static void uart_event_task(void *pvParameters)
 {
     uart_event_t event;
-    //size_t buffered_size;
-    uint8_t* dtmp = (uint8_t*) malloc(RD_BUF_SIZE);
+    uint8_t* dtmp = (uint8_t*) malloc(UART1_BUF_SIZE);
 
 	ESP_LOGI(TAG2, "Uart1 Task Started");
 
     for (;;) {
         //Waiting for UART event.
         if (xQueueReceive(Uart1_Queue, (void *)&event, (TickType_t)portMAX_DELAY)) {
-            bzero(dtmp, RD_BUF_SIZE);
+            memset(dtmp, 0, UART1_BUF_SIZE);
             ESP_LOGI(TAG2, "uart[%d] event:", UART1_NUM);
             switch (event.type) {
             //Event of UART receving data
@@ -53,9 +51,16 @@ static void uart_event_task(void *pvParameters)
                 //ESP_LOGI(TAG2, "[UART DATA]: %d", event.size);
                 uart_read_bytes(UART1_NUM, dtmp, event.size, portMAX_DELAY);
                 //ESP_LOGI(TAG2, "[DATA EVT]:");
-				Byte_Available_On_Uart1 = event.size;
-				memset ( Buffer_Temp, 0, sizeof ( Buffer_Temp));
-				memcpy ( Buffer_Temp, dtmp, event.size);
+				{
+					size_t copy_len = event.size;
+					if (copy_len > sizeof(s_rx_cache)) {
+						copy_len = sizeof(s_rx_cache);
+						ESP_LOGW(TAG2, "RX data truncated (%u -> %u)", (unsigned)event.size, (unsigned)copy_len);
+					}
+					s_rx_available = copy_len;
+					memset(s_rx_cache, 0, sizeof(s_rx_cache));
+					memcpy(s_rx_cache, dtmp, copy_len);
+				}
                 //uart_write_bytes(UART1_NUM, (const char*) dtmp, event.size);
                 break;
             //Event of HW FIFO overflow detected
@@ -103,13 +108,10 @@ static void uart_event_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
-esp_err_t Uart1_Initialize ( void )
+static esp_err_t uart1_apply_config(uint32_t baud_rate, bool full_init)
 {
-
-	/* Configure parameters of an UART driver,
-	* communication pins and install the driver */
 	uart_config_t uart_config = {
-		.baud_rate = 921600, // 921600
+		.baud_rate = baud_rate,
 		.data_bits = UART_DATA_8_BITS,
 		.parity = UART_PARITY_DISABLE,
 		.stop_bits = UART_STOP_BITS_1,
@@ -118,28 +120,51 @@ esp_err_t Uart1_Initialize ( void )
 	};
 
 	ESP_ERROR_CHECK(uart_param_config(UART1_NUM, &uart_config));
-
-	//Set UART log level
 	esp_log_level_set(TAG2, ESP_LOG_INFO);
 
-	//Set UART pins (using UART1 default pins ie no changes.)
-	ESP_ERROR_CHECK(uart_set_pin(UART1_NUM, GPIO_NUM_17, GPIO_NUM_16, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-
-	//Install UART driver, and get the queue.
-	ESP_ERROR_CHECK(uart_driver_install(UART1_NUM, BUF_SIZE , BUF_SIZE, 20, &Uart1_Queue, 0));
-
-	//Create a task to handler UART event from ISR
-    xTaskCreate(uart_event_task, "uart_event_task", 2048, NULL, 12, &Uart1_Task_xHandle);
-
-	// enable RX interrupt
-	ESP_ERROR_CHECK(uart_enable_rx_intr(UART1_NUM));
+	if (full_init) {
+		ESP_ERROR_CHECK(uart_set_pin(UART1_NUM, UART1_TX_PIN, UART1_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+		ESP_ERROR_CHECK(uart_driver_install(UART1_NUM, UART1_BUF_SIZE, UART1_BUF_SIZE, 20, &Uart1_Queue, 0));
+		xTaskCreate(uart_event_task, "uart_event_task", 2048, NULL, 12, &Uart1_Task_xHandle);
+		ESP_ERROR_CHECK(uart_enable_rx_intr(UART1_NUM));
+	}
 
 	return ESP_OK;
 }
 
+esp_err_t Uart1_Initialize ( void )
+{
+	return uart1_apply_config(921600, true);
+}
+
+esp_err_t Uart1_Initialize_1 ( void )
+{
+	return uart1_apply_config(921600, false);
+}
+
 void Uart_Write ( char* Data,  size_t Length)
 {
+    //Set UART pins (using UART1 default pins ie no changes.)
+	ESP_ERROR_CHECK(uart_set_pin(UART1_NUM, UART1_TX_PIN, UART1_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    vTaskDelay(50);
 	uart_write_bytes(UART1_NUM, Data, Length);
+    vTaskDelay(50);
+    uart_wait_tx_done(UART1_NUM, pdMS_TO_TICKS(150));
+
 	//ESP_LOGI(TAG2, "RX Done");
 }
 
+size_t Uart1_RxClaim (const uint8_t **out_buffer)
+{
+	if (s_rx_available == 0) {
+		return 0;
+	}
+
+	if (out_buffer != NULL) {
+		*out_buffer = s_rx_cache;
+	}
+
+	size_t available = s_rx_available;
+	s_rx_available = 0;
+	return available;
+}

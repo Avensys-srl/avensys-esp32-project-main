@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 
 //#include "comm_manager.h"
@@ -13,7 +14,6 @@
 #include "esp_gatts_api.h"
 #include "esp_log.h"
 #include "esp_bt_device.h"
-#include "main.h"
 
 #define GATTS_TABLE_TAG "ESP_BLE"
 
@@ -24,8 +24,6 @@
 #define SVC_INST_ID     0
 
 extern uint16_t ble_handle_table[];
-
-extern uint16_t temp_ble;
 
 /* Attributes State Machine */
 enum {
@@ -76,5 +74,7 @@ enum {
 
 void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
 void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param);
+void ble_set_runtime_ready(bool ready);
+bool ble_is_runtime_ready(void);
 
 #endif

@@ -21,7 +21,6 @@
 #include "lwip/dns.h"
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
-#include "mqtt_client.h"
 #include "nvs_flash.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
@@ -37,17 +36,12 @@
 
 #define MAX_SSID_LENGTH 32
 #define MAX_PASSWORD_LENGTH 64
+#define MQTT_TASK_STACK_SIZE (5000)
 
 extern char WIFI_SSID[MAX_SSID_LENGTH + 1];
 extern char WIFI_PASSWORD[MAX_PASSWORD_LENGTH + 1];
 
-extern bool connect_to_wifi;
-extern bool wifi_is_ssid_send;
-extern bool wifi_is_pass_send;
-
-extern esp_mqtt_client_handle_t client;
 extern bool                     read_eeprom_data;
-extern bool                     is_mqtt_ready;
 extern bool                     send_eeprom_read_request;
 
 typedef  enum{
@@ -57,21 +51,6 @@ typedef  enum{
 	WBM_Error
 } _WBM_Com_State;
 
-typedef struct {
-	bool Pairing;
-	bool Pairing_Success;
-	uint16_t Counter_1s;
-	uint16_t Counter_500ms;
-	uint16_t Counter;
-	uint16_t Counter_200ms;
-	bool Paired;
-	bool Test_In_Progress;
-	bool Error_Diconnected;
-	volatile uint16_t Counter_5s;
-	volatile bool Counter_5s_Start;
-	volatile bool Timeout;
-	bool Error_Failed;
-} __FKI_Board;
 
 typedef struct {
 	uint8_t Start_Adress;
@@ -80,22 +59,7 @@ typedef struct {
 	bool saveSteplessEnabled;
 } __Stepless;
 
-typedef struct {
-	uint8_t Not_Connected : 1;
-	uint8_t Close : 1;
-	uint8_t Moving : 1;
-	uint8_t Open : 1;
-	uint8_t No_Fki : 1;
-	uint8_t Test_In_Progress : 1;
-	uint8_t Test_Finished : 1;
-	uint8_t Test_Succeded : 1;
-} __Belimo_State;
-
-typedef struct {
-	uint8_t Fire_On_Belimo1 : 1;
-	uint8_t Fire_On_Belimo2 : 1;
-} __Fire_State;
-
 void check_update_task(void *pvParameter);
 esp_err_t nvs_read_string(const char* key, char* value, size_t max_len);
+esp_err_t nvs_write_string(const char* key, const char* value);
 #endif

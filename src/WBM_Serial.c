@@ -22,9 +22,7 @@ extern uint8_t Serial_Number_Size;
 
 extern uint8_t error;
 
-extern size_t Byte_Available_On_Uart1;
-extern uint8_t Buffer_Temp[128];
-uint8_t* Pointer_Data;
+static const uint8_t* s_rx_ptr = NULL;
 
 bool Bootloader_Mode = false;
 bool Ack_Received = false;
@@ -42,15 +40,11 @@ void Serial_end( void )
 int Serial_available( void )
 {
 	size_t Temp;
-	if ( Byte_Available_On_Uart1 != 0 )
-		{
-			Temp = Byte_Available_On_Uart1;
-			Byte_Available_On_Uart1 = 0;
-			Pointer_Data = &Buffer_Temp[0];
-			return Temp;
-		}
-	else
-		return 0;
+	Temp = Uart1_RxClaim(&s_rx_ptr);
+	if (Temp != 0) {
+		return Temp;
+	}
+	return 0;
 }
 
 int Serial_peek( void )
@@ -62,8 +56,10 @@ int Serial_read( void )
 {
 	uint8_t data = 0;
 
-	data = *Pointer_Data;
-	Pointer_Data++;
+	if (s_rx_ptr != NULL) {
+		data = *s_rx_ptr;
+		s_rx_ptr++;
+	}
 
     return data;
 }
@@ -185,6 +181,7 @@ int Read_Message()
 	else
 	{
 		Bootloader_Mode = true;
+		//gpio_set_level( Wifi_Led1, 0);
 	}
     return len;
  

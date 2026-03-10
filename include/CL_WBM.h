@@ -102,10 +102,6 @@ typedef struct __CLKTSData
 	
 	byte DSC_Status;
 	
-	__Belimo_State Belimo1_State;
-	__Belimo_State Belimo2_State;
-	__Fire_State Fire_State;
-	
 } _PACK CLKTSData;
 
 // Dati del polling Debug Data
@@ -116,6 +112,17 @@ typedef struct __CLKTSDebugData
 	byte Heater_Status;
 	byte Cooler_Status;
 	byte Dsc_Status;
+
+	int Measures_Pressure_CAPS;
+    int Measures_Pressure_CAPR;
+
+	word MeasureAirflow_CAPS;
+    word MeasureAirflow_CAPR;
+    
+    byte CAPS_LinkLevel;
+	byte CAPR_LinkLevel;
+    byte CAPS_Status;
+	byte CAPR_Status;
 } CLKTSDebugData;
 
 #define AccessoryClimaStatus_InAlarm( status )		((status & 0x10) >> 4)

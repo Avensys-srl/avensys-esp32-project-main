@@ -1,5 +1,8 @@
 #include "ble.h"
 #include "main.h"
+#include "CL_WBM.h"
+#include "mqtt_app.h"
+#include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
 
 /* The max length of characteristic value. When the GATT client performs a write or prepare write operation,
@@ -12,13 +15,12 @@
 
 #define ADV_CONFIG_FLAG      (1 << 0)
 #define SCAN_RSP_CONFIG_FLAG (1 << 1)
-
 static uint8_t adv_config_done = 0;
 
-extern bool  write_eeprom_data;
-extern bool is_bluetooth;
 extern uint16_t Read_Eeprom_Request_Index;
 extern S_EEPROM gRDEeprom;
+extern CLKTSData gKTSData;
+extern CLKTSDebugData gKTSDebugData;
 
 uint16_t ble_handle_table[HRS_IDX_NB];
 
@@ -38,35 +40,31 @@ ble_packet_t ssid_packet = {0};
 ble_packet_t password_packet = {0};
 
 static prepare_type_env_t prepare_write_env;
-static TimerHandle_t s_ble_provision_timer = NULL;
-static uint8_t s_prov_status_value = 0;
+
+typedef enum {
+    PROV_STATE_IDLE = 0,
+    PROV_STATE_WAIT_SSID,
+    PROV_STATE_WAIT_PASSWORD,
+    PROV_STATE_READY,
+    PROV_STATE_APPLYING,
+    PROV_STATE_DONE,
+    PROV_STATE_ERROR,
+    PROV_STATE_BOOTING,
+    PROV_STATE_RUNTIME_READY,
+} prov_state_t;
+
+static prov_state_t s_prov_state = PROV_STATE_IDLE;
+static uint8_t s_prov_status_value = PROV_STATE_IDLE;
 static bool s_prov_status_notify = false;
 static uint16_t s_conn_id = 0;
 static esp_gatt_if_t s_gatts_if = ESP_GATT_IF_NONE;
-static uint8_t s_eeprom_stream_buf[PREPARE_BUF_MAX_SIZE];
-static size_t s_eeprom_stream_len = 0;
-static TickType_t s_eeprom_stream_last_tick = 0;
+static TimerHandle_t s_prov_timer = NULL;
+static bool s_runtime_ready = false;
 
-#define BLE_PROVISION_TIMEOUT_MS 90000
+#define PROV_TIMEOUT_MS 90000
 
-#define PROV_STATE_IDLE          0
-#define PROV_STATE_WAIT_SSID     1
-#define PROV_STATE_WAIT_PASSWORD 2
-#define PROV_STATE_READY         3
-#define PROV_STATE_APPLYING      4
-#define PROV_STATE_DONE          5
-#define PROV_STATE_ERROR         6
-#define EEPROM_STREAM_TIMEOUT_MS 1500
-
-static void ble_reset_credential_packets(void);
-static bool ble_packet_append(ble_packet_t *packet, const uint8_t *data, size_t len, size_t max_len, const char *label);
-static void ble_packet_copy_to_string(const ble_packet_t *packet, char *out, size_t out_size);
-static void ble_provision_timeout_cb(TimerHandle_t xTimer);
-static void ble_restart_provision_timer(void);
-static void ble_stop_provision_timer(void);
-static void ble_security_init(void);
-static void ble_set_provision_status(uint8_t status);
-static bool ble_apply_eeprom_payload(const uint8_t *payload, size_t payload_len, const char *source);
+static void ble_set_prov_status(uint8_t status);
+static void ble_init_runtime_placeholders(void);
 
 static bool ble_packet_append(ble_packet_t *packet, const uint8_t *data, size_t len, size_t max_len, const char *label) {
     if (packet->data == NULL) {
@@ -104,9 +102,16 @@ static bool ble_packet_append(ble_packet_t *packet, const uint8_t *data, size_t 
     return true;
 }
 
+static void ble_packet_reset(ble_packet_t *packet) {
+    if (packet->data != NULL) {
+        free(packet->data);
+        packet->data = NULL;
+    }
+    packet->len = 0;
+}
+
 static void ble_packet_copy_to_string(const ble_packet_t *packet, char *out, size_t out_size) {
     size_t copy_len = packet->len;
-
     if (out_size == 0) {
         return;
     }
@@ -117,107 +122,74 @@ static void ble_packet_copy_to_string(const ble_packet_t *packet, char *out, siz
     if (copy_len >= out_size) {
         copy_len = out_size - 1;
     }
-
     memcpy(out, packet->data, copy_len);
     out[copy_len] = '\0';
 }
 
-static void ble_reset_credential_packets(void) {
-    if (ssid_packet.data != NULL) {
-        free(ssid_packet.data);
-        ssid_packet.data = NULL;
-    }
-    ssid_packet.len = 0;
+static void ble_prov_timeout_callback(TimerHandle_t xTimer);
 
-    if (password_packet.data != NULL) {
-        free(password_packet.data);
-        password_packet.data = NULL;
-    }
-    password_packet.len = 0;
-}
-
-static void ble_set_provision_status(uint8_t status) {
-    s_prov_status_value = status;
-
-    if (ble_handle_table[IDX_CHAR_VAL_PROV_STATUS] != 0) {
-        esp_ble_gatts_set_attr_value(ble_handle_table[IDX_CHAR_VAL_PROV_STATUS], sizeof(s_prov_status_value), &s_prov_status_value);
-    }
-
-    if (s_prov_status_notify && s_gatts_if != ESP_GATT_IF_NONE && ble_handle_table[IDX_CHAR_VAL_PROV_STATUS] != 0) {
-        (void)esp_ble_gatts_send_indicate(s_gatts_if,
-                                          s_conn_id,
-                                          ble_handle_table[IDX_CHAR_VAL_PROV_STATUS],
-                                          sizeof(s_prov_status_value),
-                                          &s_prov_status_value,
-                                          false);
-    }
-}
-
-static void ble_provision_timeout_cb(TimerHandle_t xTimer) {
-    (void)xTimer;
-    ESP_LOGW(GATTS_TABLE_TAG, "BLE provisioning timeout, resetting pending SSID/password");
-    ble_reset_credential_packets();
-    wifi_is_ssid_send = false;
-    wifi_is_pass_send = false;
-    connect_to_wifi = false;
-    ble_set_provision_status(PROV_STATE_ERROR);
-}
-
-static void ble_restart_provision_timer(void) {
-    if (s_ble_provision_timer == NULL) {
-        s_ble_provision_timer = xTimerCreate("ble_prov_to",
-                                             pdMS_TO_TICKS(BLE_PROVISION_TIMEOUT_MS),
-                                             pdFALSE,
-                                             NULL,
-                                             ble_provision_timeout_cb);
-        if (s_ble_provision_timer == NULL) {
-            ESP_LOGW(GATTS_TABLE_TAG, "Failed to create BLE provisioning timer");
+static void ble_prov_timer_reset(void) {
+    if (s_prov_timer == NULL) {
+        s_prov_timer = xTimerCreate("prov_timer", pdMS_TO_TICKS(PROV_TIMEOUT_MS), pdFALSE, NULL, ble_prov_timeout_callback);
+        if (s_prov_timer == NULL) {
             return;
         }
     }
-
-    (void)xTimerStop(s_ble_provision_timer, 0);
-    (void)xTimerStart(s_ble_provision_timer, 0);
+    xTimerStop(s_prov_timer, 0);
+    xTimerStart(s_prov_timer, 0);
 }
 
-static void ble_stop_provision_timer(void) {
-    if (s_ble_provision_timer != NULL) {
-        (void)xTimerStop(s_ble_provision_timer, 0);
+static void ble_prov_timeout_callback(TimerHandle_t xTimer) {
+    (void)xTimer;
+    ble_packet_reset(&ssid_packet);
+    ble_packet_reset(&password_packet);
+    ble_set_prov_status(PROV_STATE_ERROR);
+}
+
+static void ble_prov_reset(void) {
+    ble_packet_reset(&ssid_packet);
+    ble_packet_reset(&password_packet);
+    ble_set_prov_status(PROV_STATE_WAIT_SSID);
+}
+
+static void ble_set_prov_status(uint8_t status) {
+    s_prov_status_value = status;
+    s_prov_state = (prov_state_t)status;
+
+    esp_ble_gatts_set_attr_value(ble_handle_table[IDX_CHAR_VAL_PROV_STATUS], sizeof(s_prov_status_value), &s_prov_status_value);
+    if (s_prov_status_notify && s_gatts_if != ESP_GATT_IF_NONE) {
+        esp_ble_gatts_send_indicate(s_gatts_if, s_conn_id, ble_handle_table[IDX_CHAR_VAL_PROV_STATUS],
+                                    sizeof(s_prov_status_value), &s_prov_status_value, false);
+    }
+
+    if (s_prov_state == PROV_STATE_WAIT_SSID || s_prov_state == PROV_STATE_WAIT_PASSWORD || s_prov_state == PROV_STATE_READY) {
+        ble_prov_timer_reset();
+    } else if (s_prov_timer != NULL) {
+        xTimerStop(s_prov_timer, 0);
     }
 }
 
-static void ble_security_init(void) {
-    esp_ble_auth_req_t auth_req = ESP_LE_AUTH_REQ_SC_BOND;
-    esp_ble_io_cap_t iocap = ESP_IO_CAP_NONE;
-    uint8_t key_size = 16;
-    uint8_t init_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
-    uint8_t resp_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
-
-    (void)esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth_req, sizeof(auth_req));
-    (void)esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &iocap, sizeof(iocap));
-    (void)esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, sizeof(key_size));
-    (void)esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, sizeof(init_key));
-    (void)esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &resp_key, sizeof(resp_key));
+void ble_set_runtime_ready(bool ready) {
+    s_runtime_ready = ready;
+    if (ready) {
+        ble_set_prov_status(PROV_STATE_RUNTIME_READY);
+    } else {
+        ble_set_prov_status(PROV_STATE_BOOTING);
+    }
 }
 
-static bool ble_apply_eeprom_payload(const uint8_t *payload, size_t payload_len, const char *source) {
-    size_t required_len = sizeof(gRDEeprom);
-    if (payload == NULL || payload_len < required_len) {
-        ESP_LOGW(GATTS_TABLE_TAG, "EEPROM write ignored (%s): payload too short (%d < %d)",
-                 source, (int)payload_len, (int)required_len);
-        return false;
-    }
+bool ble_is_runtime_ready(void) {
+    return s_runtime_ready;
+}
 
-    memcpy(&gRDEeprom, payload, required_len);
-    ESP_LOGI(GATTS_TABLE_TAG, "EEPROM write accepted from %s, len=%d", source, (int)payload_len);
+static void ble_init_runtime_placeholders(void) {
+    memset(&gRDEeprom, 0, sizeof(gRDEeprom));
+    memset(&gKTSData, 0, sizeof(gKTSData));
+    memset(&gKTSDebugData, 0, sizeof(gKTSDebugData));
 
-    Read_Eeprom_Request_Index |= 0x800;
-    Read_Eeprom_Request_Index |= 0x1000;
-    Read_Eeprom_Request_Index |= 0x2000;
-    Read_Eeprom_Request_Index |= 0x4000;
-    Read_Eeprom_Request_Index |= 0x8000;
-    ESP_LOGI(GATTS_TABLE_TAG, "EEPROM write request queued");
-    return true;
+    esp_ble_gatts_set_attr_value(ble_handle_table[IDX_CHAR_VAL_EEPROM_DATA], sizeof(gRDEeprom), (uint8_t *)&gRDEeprom);
+    esp_ble_gatts_set_attr_value(ble_handle_table[IDX_CHAR_VAL_POLLIING], sizeof(gKTSData), (uint8_t *)&gKTSData);
+    esp_ble_gatts_set_attr_value(ble_handle_table[IDX_CHAR_VAL_DEBUG_DATA], sizeof(gKTSDebugData), (uint8_t *)&gKTSDebugData);
 }
 
 static uint8_t service_uuid[16] = {
@@ -492,21 +464,72 @@ static const esp_gatts_attr_db_t gatt_db[HRS_IDX_NB] = {
 };
 
 
-// Funzione per scrivere una stringa nella NVS
-esp_err_t nvs_write_string(const char* key, const char* value) {
-    nvs_handle_t my_handle;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &my_handle);
-    if (err != ESP_OK) return err;
+static void ble_security_init(void) {
+    esp_ble_auth_req_t auth_req = ESP_LE_AUTH_REQ_SC_BOND;
+    esp_ble_io_cap_t iocap = ESP_IO_CAP_NONE;
+    uint8_t key_size = 16;
+    uint8_t init_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+    uint8_t resp_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
 
-    err = nvs_set_str(my_handle, key, value);
-    if (err != ESP_OK) {
-        nvs_close(my_handle);
-        return err;
+    esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth_req, sizeof(uint8_t));
+    esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &iocap, sizeof(uint8_t));
+    esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, sizeof(uint8_t));
+    esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, sizeof(uint8_t));
+    esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &resp_key, sizeof(uint8_t));
+}
+
+static void handle_write_event(esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param) {
+    ble_prov_timer_reset();
+    if (param->write.handle == ble_handle_table[IDX_CHAR_VAL_WIFI_SSID]) {
+        ESP_LOGI(GATTS_TABLE_TAG, "WIFI SSID");
+
+        if (!ble_packet_append(&ssid_packet, param->write.value, param->write.len, MAX_SSID_LENGTH, "SSID")) {
+            ble_set_prov_status(PROV_STATE_ERROR);
+            return;
+        }
+
+        ble_packet_copy_to_string(&ssid_packet, WIFI_SSID, sizeof(WIFI_SSID));
+        if (password_packet.len > 0) {
+            ble_set_prov_status(PROV_STATE_READY);
+            (void)mqtt_enqueue_wifi_credentials(WIFI_SSID, WIFI_PASSWORD, true, "ble-auto");
+        } else {
+            ble_set_prov_status(PROV_STATE_WAIT_PASSWORD);
+        }
+    } else if (param->write.handle == ble_handle_table[IDX_CHAR_VAL_WIFI_PASSWORD]) {
+        ESP_LOGI(GATTS_TABLE_TAG, "WIFI Password");
+
+        if (!ble_packet_append(&password_packet, param->write.value, param->write.len, MAX_PASSWORD_LENGTH, "password")) {
+            ble_set_prov_status(PROV_STATE_ERROR);
+            return;
+        }
+
+        ble_packet_copy_to_string(&password_packet, WIFI_PASSWORD, sizeof(WIFI_PASSWORD));
+        if (ssid_packet.len == 0) {
+            ble_set_prov_status(PROV_STATE_WAIT_SSID);
+        } else {
+            ble_set_prov_status(PROV_STATE_READY);
+            (void)mqtt_enqueue_wifi_credentials(WIFI_SSID, WIFI_PASSWORD, true, "ble-auto");
+        }
+    } else if (param->write.handle == ble_handle_table[IDX_CHAR_VAL_CONNECT_TO_CLOUD]) {
+        if (ssid_packet.len == 0 || password_packet.len == 0) {
+            ESP_LOGE(GATTS_TABLE_TAG, "Provisioning incomplete");
+            ble_set_prov_status(PROV_STATE_ERROR);
+        } else {
+            ble_set_prov_status(PROV_STATE_APPLYING);
+            bool queued = mqtt_enqueue_wifi_credentials(WIFI_SSID, WIFI_PASSWORD, true, "ble");
+            if (queued) {
+                ble_set_prov_status(PROV_STATE_DONE);
+                ble_packet_reset(&ssid_packet);
+                ble_packet_reset(&password_packet);
+            } else {
+                ble_set_prov_status(PROV_STATE_ERROR);
+            }
+        }
     }
 
-    err = nvs_commit(my_handle);
-    nvs_close(my_handle);
-    return err;
+    if (param->write.need_rsp) {
+        esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, NULL);
+    }
 }
 
 
@@ -549,9 +572,9 @@ void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
             break;
         case ESP_GAP_BLE_AUTH_CMPL_EVT:
             if (param->ble_security.auth_cmpl.success) {
-                ESP_LOGI(GATTS_TABLE_TAG, "BLE auth complete");
+                ESP_LOGI(GATTS_TABLE_TAG, "BLE auth complete, bonded");
             } else {
-                ESP_LOGW(GATTS_TABLE_TAG, "BLE auth failed, reason=%d", param->ble_security.auth_cmpl.fail_reason);
+                ESP_LOGE(GATTS_TABLE_TAG, "BLE auth failed, status=%d", param->ble_security.auth_cmpl.fail_reason);
             }
             break;
         default:
@@ -559,7 +582,7 @@ void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
     }
 }
 
-void prepare_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param) {
+static void prepare_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param) {
     ESP_LOGI(GATTS_TABLE_TAG, "prepare write, handle = %d, value len = %d", param->write.handle, param->write.len);
     esp_gatt_status_t status = ESP_GATT_OK;
     if (prepare_write_env->prepare_buf == NULL) {
@@ -602,11 +625,18 @@ void prepare_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t *prepare
     prepare_write_env->prepare_len += param->write.len;
 }
 
-void exec_write_event_env(prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param) {
+static void exec_write_event_env(prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param) {
     if (param->exec_write.exec_write_flag == ESP_GATT_PREP_WRITE_EXEC && prepare_write_env->prepare_buf) {
         esp_log_buffer_hex(GATTS_TABLE_TAG, prepare_write_env->prepare_buf, prepare_write_env->prepare_len);
          ESP_LOGI(GATTS_TABLE_TAG, "Lenght : %d", prepare_write_env->prepare_len);
-         (void)ble_apply_eeprom_payload(prepare_write_env->prepare_buf, prepare_write_env->prepare_len, "prepare-write");
+         memcpy(&gRDEeprom, prepare_write_env->prepare_buf, sizeof(gRDEeprom));
+         ESP_LOGI(GATTS_TABLE_TAG, "Speed : %d", gRDEeprom.sel_idxStepMotors);
+         Read_Eeprom_Request_Index |= 0x800;
+         Read_Eeprom_Request_Index |= 0x1000;
+         Read_Eeprom_Request_Index |= 0x2000;
+         Read_Eeprom_Request_Index |= 0x4000;
+         Read_Eeprom_Request_Index |= 0x8000;
+         ESP_LOGI(GATTS_TABLE_TAG, "Invio scrittura completata");
         
     } else {
         ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATT_PREP_WRITE_CANCEL");
@@ -633,6 +663,7 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             if (set_dev_name_ret) {
                 ESP_LOGE(GATTS_TABLE_TAG, "set device name failed, error code = %x", set_dev_name_ret);
             }
+
             ble_security_init();
 
             // config adv data
@@ -654,114 +685,25 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             }
         } break;
         case ESP_GATTS_READ_EVT:
-            // ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATTS_READ_EVT");
+            comm_led_mark_activity_source("BLE_READ");
+            if (!s_runtime_ready &&
+                (param->read.handle == ble_handle_table[IDX_CHAR_VAL_EEPROM_DATA] ||
+                 param->read.handle == ble_handle_table[IDX_CHAR_VAL_POLLIING] ||
+                 param->read.handle == ble_handle_table[IDX_CHAR_VAL_DEBUG_DATA])) {
+                ESP_LOGI(GATTS_TABLE_TAG, "Read while booting: handle=%d", param->read.handle);
+            }
             break;
 
-case ESP_GATTS_WRITE_EVT:
+        case ESP_GATTS_WRITE_EVT:
+            comm_led_mark_activity_source("BLE_WRITE");
             if (!param->write.is_prep) {
                 ESP_LOGI(GATTS_TABLE_TAG, "GATT_WRITE_EVT, handle = %d, value len = %d", param->write.handle, param->write.len);
                 esp_log_buffer_hex(GATTS_TABLE_TAG, param->write.value, param->write.len);
-
-                if (param->write.handle == ble_handle_table[IDX_CHAR_VAL_EEPROM_DATA]) {
-                    TickType_t now = xTaskGetTickCount();
-                    if (s_eeprom_stream_len > 0 &&
-                        (now - s_eeprom_stream_last_tick) > pdMS_TO_TICKS(EEPROM_STREAM_TIMEOUT_MS)) {
-                        ESP_LOGW(GATTS_TABLE_TAG, "EEPROM stream timeout, resetting partial buffer (%d bytes)", (int)s_eeprom_stream_len);
-                        s_eeprom_stream_len = 0;
-                    }
-
-                    s_eeprom_stream_last_tick = now;
-
-                    if (param->write.len >= sizeof(gRDEeprom)) {
-                        (void)ble_apply_eeprom_payload(param->write.value, param->write.len, "write-direct");
-                        s_eeprom_stream_len = 0;
-                    } else {
-                        if ((s_eeprom_stream_len + param->write.len) > sizeof(s_eeprom_stream_buf)) {
-                            ESP_LOGE(GATTS_TABLE_TAG, "EEPROM stream overflow (%d + %d), dropping stream",
-                                     (int)s_eeprom_stream_len, param->write.len);
-                            s_eeprom_stream_len = 0;
-                        } else {
-                            memcpy(s_eeprom_stream_buf + s_eeprom_stream_len, param->write.value, param->write.len);
-                            s_eeprom_stream_len += param->write.len;
-                            ESP_LOGI(GATTS_TABLE_TAG, "EEPROM stream chunk received, total=%d", (int)s_eeprom_stream_len);
-
-                            if (s_eeprom_stream_len >= sizeof(gRDEeprom)) {
-                                (void)ble_apply_eeprom_payload(s_eeprom_stream_buf, s_eeprom_stream_len, "write-stream");
-                                s_eeprom_stream_len = 0;
-                            }
-                        }
-                    }
-                } else if (param->write.handle == ble_handle_table[IDX_CHAR_VAL_WIFI_SSID]) {
-                    ESP_LOGI(GATTS_TABLE_TAG, "WIFI SSID");
-                    ble_restart_provision_timer();
-
-                    if (!ble_packet_append(&ssid_packet, param->write.value, param->write.len, MAX_SSID_LENGTH, "SSID")) {
-                        ble_reset_credential_packets();
-                        wifi_is_ssid_send = false;
-                        connect_to_wifi = false;
-                        break;
-                    }
-
-                    ble_packet_copy_to_string(&ssid_packet, WIFI_SSID, sizeof(WIFI_SSID));
-                    wifi_is_ssid_send = true;
-                    if (wifi_is_pass_send) {
-                        ble_set_provision_status(PROV_STATE_READY);
-                    } else {
-                        ble_set_provision_status(PROV_STATE_WAIT_PASSWORD);
-                    }
-
-                    // Scrivi SSID nella NVS
-                    esp_err_t err = nvs_write_string("wifi_ssid", WIFI_SSID);
-                    if (err != ESP_OK) {
-                        ESP_LOGE(GATTS_TABLE_TAG, "Error (%s) writing SSID to NVS!", esp_err_to_name(err));
-                    } else {
-                        ESP_LOGI(GATTS_TABLE_TAG, "SSID written to NVS successfully");
-                    }
-                } else if (param->write.handle == ble_handle_table[IDX_CHAR_VAL_WIFI_PASSWORD]) {
-                    ESP_LOGI(GATTS_TABLE_TAG, "WIFI Password");
-                    ble_restart_provision_timer();
-
-                    if (!ble_packet_append(&password_packet, param->write.value, param->write.len, MAX_PASSWORD_LENGTH, "password")) {
-                        ble_reset_credential_packets();
-                        wifi_is_pass_send = false;
-                        connect_to_wifi = false;
-                        break;
-                    }
-
-                    ble_packet_copy_to_string(&password_packet, WIFI_PASSWORD, sizeof(WIFI_PASSWORD));
-                    wifi_is_pass_send = true;
-                    if (wifi_is_ssid_send) {
-                        ble_set_provision_status(PROV_STATE_READY);
-                    } else {
-                        ble_set_provision_status(PROV_STATE_WAIT_SSID);
-                    }
-
-                    // Scrivi Password nella NVS
-                    esp_err_t err = nvs_write_string("wifi_pass", WIFI_PASSWORD);
-                    if (err != ESP_OK) {
-                        ESP_LOGE(GATTS_TABLE_TAG, "Error (%s) writing password to NVS!", esp_err_to_name(err));
-                    } else {
-                        ESP_LOGI(GATTS_TABLE_TAG, "Password written to NVS successfully");
-                    }
-                } else if (param->write.handle == ble_handle_table[IDX_CHAR_VAL_CONNECT_TO_CLOUD]) {
-                    if (wifi_is_ssid_send && wifi_is_pass_send) {
-                        ble_set_provision_status(PROV_STATE_APPLYING);
-                    } else {
-                        ble_set_provision_status(PROV_STATE_ERROR);
-                    }
-                } else if (param->write.handle == ble_handle_table[IDX_CHAR_PROV_STATUS_CFG] && param->write.len == 2) {
-                    uint16_t notify_en = ((uint16_t)param->write.value[1] << 8) | param->write.value[0];
+                if (param->write.handle == ble_handle_table[IDX_CHAR_PROV_STATUS_CFG] && param->write.len == 2) {
+                    uint16_t notify_en = param->write.value[1] << 8 | param->write.value[0];
                     s_prov_status_notify = (notify_en == 0x0001);
-                }
-
-                connect_to_wifi = (wifi_is_ssid_send && wifi_is_pass_send);
-                if (connect_to_wifi) {
-                    ble_stop_provision_timer();
-                    ble_reset_credential_packets();
-                    ble_set_provision_status(PROV_STATE_DONE);
-                }
-                if (param->write.need_rsp) {
-                    esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, NULL);
+                } else {
+                    handle_write_event(gatts_if, param);
                 }
             } else {
                 prepare_write_event_env(gatts_if, &prepare_write_env, param);
@@ -784,12 +726,12 @@ case ESP_GATTS_WRITE_EVT:
             break;
         case ESP_GATTS_CONNECT_EVT:
             ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATTS_CONNECT_EVT, conn_id = %d", param->connect.conn_id);
+            comm_led_mark_activity_source("BLE_CONNECT");
             esp_log_buffer_hex(GATTS_TABLE_TAG, param->connect.remote_bda, 6);
             s_conn_id = param->connect.conn_id;
             s_gatts_if = gatts_if;
             esp_ble_set_encryption(param->connect.remote_bda, ESP_BLE_SEC_ENCRYPT_NO_MITM);
-            ble_restart_provision_timer();
-            ble_set_provision_status(PROV_STATE_WAIT_SSID);
+            ble_prov_timer_reset();
             esp_ble_conn_update_params_t conn_params = {0};
             memcpy(conn_params.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
             /* For the iOS system, please refer to Apple official documents about the BLE connection parameters restrictions. */
@@ -802,15 +744,12 @@ case ESP_GATTS_WRITE_EVT:
             break;
         case ESP_GATTS_DISCONNECT_EVT:
             ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATTS_DISCONNECT_EVT, reason = 0x%x", param->disconnect.reason);
-            ble_stop_provision_timer();
-            ble_reset_credential_packets();
-            s_eeprom_stream_len = 0;
-            wifi_is_ssid_send = false;
-            wifi_is_pass_send = false;
-            connect_to_wifi = false;
+            comm_led_mark_activity_source("BLE_DISCONNECT");
             s_prov_status_notify = false;
-            s_gatts_if = ESP_GATT_IF_NONE;
-            ble_set_provision_status(PROV_STATE_IDLE);
+            if (s_prov_timer != NULL) {
+                xTimerStop(s_prov_timer, 0);
+            }
+            ble_prov_reset();
             esp_ble_gap_start_advertising(&adv_params);
             break;
         case ESP_GATTS_CREAT_ATTR_TAB_EVT: {
@@ -825,7 +764,8 @@ case ESP_GATTS_WRITE_EVT:
                 ESP_LOGI(GATTS_TABLE_TAG, "create attribute table successfully, the number handle = %d\n", param->add_attr_tab.num_handle);
                 memcpy(ble_handle_table, param->add_attr_tab.handles, sizeof(ble_handle_table));
                 esp_ble_gatts_start_service(ble_handle_table[IDX_SVC]);
-                ble_set_provision_status(PROV_STATE_IDLE);
+                ble_init_runtime_placeholders();
+                ble_set_runtime_ready(false);
             }
             break;
         }
