@@ -142,7 +142,8 @@ static void ble_schedule_full_eeprom_write(const char *source) {
 
 // Convert legacy 242-byte EEPROM payload to firmware 241-byte layout.
 static bool ble_apply_legacy242_eeprom(const uint8_t *legacy, size_t legacy_len) {
-    if (legacy == NULL || legacy_len != (sizeof(gRDEeprom) + 1)) {
+    // Legacy mapping is only needed for the old 241-byte internal layout.
+    if (legacy == NULL || sizeof(gRDEeprom) != 241 || legacy_len != 242) {
         return false;
     }
 
@@ -160,6 +161,30 @@ static bool ble_apply_legacy242_eeprom(const uint8_t *legacy, size_t legacy_len)
     dst[239] = legacy[240];
     dst[240] = 0;
 
+    return true;
+}
+
+static bool ble_apply_eeprom_payload(const uint8_t *payload, size_t payload_len, const char *source) {
+    if (payload == NULL || payload_len < 241) {
+        ESP_LOGW(GATTS_TABLE_TAG, "EEPROM %s rejected: payload too short (%u)", source ? source : "write",
+                 (unsigned)payload_len);
+        return false;
+    }
+
+    // Special conversion path for old internal 241-byte map.
+    if (ble_apply_legacy242_eeprom(payload, payload_len)) {
+        ESP_LOGI(GATTS_TABLE_TAG, "EEPROM %s accepted with legacy242->241 mapping", source ? source : "write");
+        return true;
+    }
+
+    memset(&gRDEeprom, 0, sizeof(gRDEeprom));
+    size_t copy_len = payload_len;
+    if (copy_len > sizeof(gRDEeprom)) {
+        copy_len = sizeof(gRDEeprom);
+    }
+    memcpy(&gRDEeprom, payload, copy_len);
+    ESP_LOGI(GATTS_TABLE_TAG, "EEPROM %s accepted len=%u copied=%u struct=%u",
+             source ? source : "write", (unsigned)payload_len, (unsigned)copy_len, (unsigned)sizeof(gRDEeprom));
     return true;
 }
 
@@ -522,16 +547,11 @@ static void ble_security_init(void) {
 static void handle_write_event(esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param) {
     ble_prov_timer_reset();
     if (param->write.handle == ble_handle_table[IDX_CHAR_VAL_EEPROM_DATA]) {
-        if (param->write.len == sizeof(gRDEeprom)) {
-            memcpy(&gRDEeprom, param->write.value, sizeof(gRDEeprom));
+        if (ble_apply_eeprom_payload(param->write.value, param->write.len, "write-direct")) {
             esp_ble_gatts_set_attr_value(ble_handle_table[IDX_CHAR_VAL_EEPROM_DATA], sizeof(gRDEeprom), (uint8_t *)&gRDEeprom);
             ble_schedule_full_eeprom_write("write-direct");
-        } else if (ble_apply_legacy242_eeprom(param->write.value, param->write.len)) {
-            esp_ble_gatts_set_attr_value(ble_handle_table[IDX_CHAR_VAL_EEPROM_DATA], sizeof(gRDEeprom), (uint8_t *)&gRDEeprom);
-            ble_schedule_full_eeprom_write("write-legacy242");
         } else {
-            ESP_LOGW(GATTS_TABLE_TAG, "Unsupported EEPROM write len=%u (expected %u or %u)",
-                     (unsigned)param->write.len, (unsigned)sizeof(gRDEeprom), (unsigned)(sizeof(gRDEeprom) + 1));
+            ESP_LOGW(GATTS_TABLE_TAG, "Unsupported EEPROM write len=%u", (unsigned)param->write.len);
         }
     } else if (param->write.handle == ble_handle_table[IDX_CHAR_VAL_WIFI_SSID]) {
         ESP_LOGI(GATTS_TABLE_TAG, "WIFI SSID");
@@ -684,8 +704,7 @@ static void exec_write_event_env(prepare_type_env_t *prepare_write_env, esp_ble_
         esp_log_buffer_hex(GATTS_TABLE_TAG, prepare_write_env->prepare_buf, prepare_write_env->prepare_len);
          ESP_LOGI(GATTS_TABLE_TAG, "Lenght : %d", prepare_write_env->prepare_len);
          if (prepare_write_env->prepare_handle == ble_handle_table[IDX_CHAR_VAL_EEPROM_DATA]) {
-             if (prepare_write_env->prepare_len >= (int)sizeof(gRDEeprom)) {
-                 memcpy(&gRDEeprom, prepare_write_env->prepare_buf, sizeof(gRDEeprom));
+             if (ble_apply_eeprom_payload(prepare_write_env->prepare_buf, (size_t)prepare_write_env->prepare_len, "prepare-write")) {
                  esp_ble_gatts_set_attr_value(ble_handle_table[IDX_CHAR_VAL_EEPROM_DATA], sizeof(gRDEeprom), (uint8_t *)&gRDEeprom);
                  ESP_LOGI(GATTS_TABLE_TAG, "Speed : %d", gRDEeprom.sel_idxStepMotors);
                  ble_schedule_full_eeprom_write("prepare-write");
