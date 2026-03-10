@@ -37,6 +37,10 @@ bool Ota_In_Progress = false;
 static char *json_response = NULL;
 static int total_len = 0;
 
+#define OTA_FAIL_COUNT_KEY "ota_fail_cnt"
+#define OTA_FAIL_VER_KEY   "ota_fail_ver"
+#define OTA_FAIL_MAX_RETRY 3
+
 static int ota_parse_semver(const char *version, int *major, int *minor, int *patch) {
     if (version == NULL || major == NULL || minor == NULL || patch == NULL) {
         return -1;
@@ -149,6 +153,121 @@ esp_err_t nvs_write_string(const char* key, const char* value) {
 
     nvs_close(my_handle);
     return err;
+}
+
+static esp_err_t nvs_read_i32(const char* key, int32_t *out_value) {
+    nvs_handle_t my_handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &my_handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_get_i32(my_handle, key, out_value);
+    nvs_close(my_handle);
+    return err;
+}
+
+static esp_err_t nvs_write_i32(const char* key, int32_t value) {
+    nvs_handle_t my_handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &my_handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_i32(my_handle, key, value);
+    if (err == ESP_OK) {
+        err = nvs_commit(my_handle);
+    }
+    nvs_close(my_handle);
+    return err;
+}
+
+static void ota_clear_failure_state(void) {
+    (void)nvs_write_i32(OTA_FAIL_COUNT_KEY, 0);
+    (void)nvs_write_string(OTA_FAIL_VER_KEY, "");
+}
+
+static void ota_record_failure(const char *version) {
+    char failed_version[32] = {0};
+    int32_t fail_count = 0;
+    esp_err_t ver_err = nvs_read_string(OTA_FAIL_VER_KEY, failed_version, sizeof(failed_version));
+    esp_err_t cnt_err = nvs_read_i32(OTA_FAIL_COUNT_KEY, &fail_count);
+
+    if (ver_err != ESP_OK) {
+        failed_version[0] = '\0';
+    }
+    if (cnt_err != ESP_OK) {
+        fail_count = 0;
+    }
+
+    if (version != NULL && strcmp(failed_version, version) == 0) {
+        fail_count++;
+    } else {
+        fail_count = 1;
+        (void)nvs_write_string(OTA_FAIL_VER_KEY, version ? version : "");
+    }
+
+    (void)nvs_write_i32(OTA_FAIL_COUNT_KEY, fail_count);
+    ESP_LOGW(TAG_OTA, "OTA failure recorded: version=%s count=%ld",
+             version ? version : "unknown", (long)fail_count);
+}
+
+static bool ota_should_skip_for_failed_version(const char *version) {
+    char failed_version[32] = {0};
+    int32_t fail_count = 0;
+
+    if (version == NULL) {
+        return false;
+    }
+
+    if (nvs_read_string(OTA_FAIL_VER_KEY, failed_version, sizeof(failed_version)) != ESP_OK) {
+        return false;
+    }
+    if (nvs_read_i32(OTA_FAIL_COUNT_KEY, &fail_count) != ESP_OK) {
+        return false;
+    }
+
+    if (strcmp(failed_version, version) == 0 && fail_count >= OTA_FAIL_MAX_RETRY) {
+        ESP_LOGW(TAG_OTA, "Disaster recovery: skip OTA for version %s after %ld failed attempts",
+                 version, (long)fail_count);
+        return true;
+    }
+    return false;
+}
+
+static bool ota_preflight_image(const char *url) {
+    if (url == NULL || url[0] == '\0') {
+        return false;
+    }
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 12000,
+        .skip_cert_common_name_check = true,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (client == NULL) {
+        return false;
+    }
+
+    esp_http_client_set_method(client, HTTP_METHOD_HEAD);
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    long content_len = esp_http_client_get_content_length(client);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK || status < 200 || status >= 300) {
+        ESP_LOGW(TAG_OTA, "OTA preflight failed: err=%s status=%d", esp_err_to_name(err), status);
+        return false;
+    }
+
+    // Accept both known positive size and chunked/unknown (-1).
+    if (content_len == 0) {
+        ESP_LOGW(TAG_OTA, "OTA preflight failed: empty payload");
+        return false;
+    }
+
+    ESP_LOGI(TAG_OTA, "OTA preflight OK: status=%d content_len=%ld", status, content_len);
+    return true;
 }
 
 static esp_err_t _http_event_handler(esp_http_client_event_t *evt)
@@ -384,6 +503,26 @@ void check_update_task(void *pvParameter) {
 
                 int cmp = ota_compare_versions(CURRENT_VERSION, version->valuestring);
                 if (cmp > 0) {
+                    if (ota_should_skip_for_failed_version(version->valuestring)) {
+                        Ota_In_Progress = false;
+                        cJSON_Delete(json);
+                        free(json_response);
+                        json_response = NULL;
+                        esp_http_client_cleanup(client);
+                        vTaskDelete(NULL);
+                        return;
+                    }
+                    if (!ota_preflight_image(url->valuestring)) {
+                        ESP_LOGW(TAG_OTA, "Skipping OTA: image preflight failed");
+                        ota_record_failure(version->valuestring);
+                        Ota_In_Progress = false;
+                        cJSON_Delete(json);
+                        free(json_response);
+                        json_response = NULL;
+                        esp_http_client_cleanup(client);
+                        vTaskDelete(NULL);
+                        return;
+                    }
                     ESP_LOGI(TAG_OTA, "Newer firmware available, updating...");
 					Ota_In_Progress = true;
 					Counter_Led1 = 0;
@@ -398,14 +537,17 @@ void check_update_task(void *pvParameter) {
                     esp_err_t ret = esp_https_ota(&ota_config);
                     if (ret == ESP_OK) {
                         ESP_LOGI(TAG_OTA, "OTA Succeed, Rebooting...");
+                        ota_clear_failure_state();
 						Ota_In_Progress = false;
                         esp_restart();
                     } else {
                         ESP_LOGE(TAG_OTA, "OTA Failed...");
+                        ota_record_failure(version->valuestring);
 						Ota_In_Progress = false;
                     }
                 } else if (cmp == 0) {
                     ESP_LOGI(TAG_OTA, "Firmware is up to date");
+                    ota_clear_failure_state();
 					Ota_In_Progress = false;
                 } else {
                     ESP_LOGW(TAG_OTA, "Skipping OTA: available version is not newer (current=%s, available=%s)",
