@@ -31,7 +31,7 @@ char WIFI_PASSWORD[MAX_PASSWORD_LENGTH + 1] = "TGRRFEZGZR";
 //char WIFI_PASSWORD[MAX_PASSWORD_LENGTH + 1] = "558FC4A469ZE6";
 
 static const char *TAG_OTA =  "OTA";
-static const char *CURRENT_VERSION =  "1.0.2"; //versione corrente del firmware
+static const char *CURRENT_VERSION =  "1.0.3"; //versione corrente del firmware
 bool Ota_In_Progress = false;
 
 static char *json_response = NULL;
