@@ -37,6 +37,32 @@ bool Ota_In_Progress = false;
 static char *json_response = NULL;
 static int total_len = 0;
 
+static int ota_parse_semver(const char *version, int *major, int *minor, int *patch) {
+    if (version == NULL || major == NULL || minor == NULL || patch == NULL) {
+        return -1;
+    }
+    if (sscanf(version, "%d.%d.%d", major, minor, patch) != 3) {
+        return -1;
+    }
+    return 0;
+}
+
+// Returns: 1 if available > current, 0 if equal, -1 if available < current or parse error.
+static int ota_compare_versions(const char *current, const char *available) {
+    int cmaj, cmin, cpat;
+    int amaj, amin, apat;
+
+    if (ota_parse_semver(current, &cmaj, &cmin, &cpat) != 0 ||
+        ota_parse_semver(available, &amaj, &amin, &apat) != 0) {
+        return -1;
+    }
+
+    if (amaj != cmaj) return (amaj > cmaj) ? 1 : -1;
+    if (amin != cmin) return (amin > cmin) ? 1 : -1;
+    if (apat != cpat) return (apat > cpat) ? 1 : -1;
+    return 0;
+}
+
 bool send_eeprom_read_request = false;
 
 // Variables
@@ -356,8 +382,9 @@ void check_update_task(void *pvParameter) {
                 ESP_LOGI(TAG_OTA, "Current version: %s", CURRENT_VERSION);
                 ESP_LOGI(TAG_OTA, "Available version: %s", version->valuestring);
 
-                if (strcmp(CURRENT_VERSION, version->valuestring) != 0) {
-                    ESP_LOGI(TAG_OTA, "New firmware available, updating...");
+                int cmp = ota_compare_versions(CURRENT_VERSION, version->valuestring);
+                if (cmp > 0) {
+                    ESP_LOGI(TAG_OTA, "Newer firmware available, updating...");
 					Ota_In_Progress = true;
 					Counter_Led1 = 0;
                     esp_http_client_config_t ota_http_config = {
@@ -377,9 +404,13 @@ void check_update_task(void *pvParameter) {
                         ESP_LOGE(TAG_OTA, "OTA Failed...");
 						Ota_In_Progress = false;
                     }
-                } else {
+                } else if (cmp == 0) {
                     ESP_LOGI(TAG_OTA, "Firmware is up to date");
 					Ota_In_Progress = false;
+                } else {
+                    ESP_LOGW(TAG_OTA, "Skipping OTA: available version is not newer (current=%s, available=%s)",
+                             CURRENT_VERSION, version->valuestring);
+                    Ota_In_Progress = false;
                 }
             } else {
                 ESP_LOGE(TAG_OTA, "JSON format is incorrect");
