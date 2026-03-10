@@ -24,6 +24,8 @@ extern uint8_t Serial_Number_Size;
 extern uint8_t error;
 
 static const uint8_t* s_rx_ptr = NULL;
+static size_t s_rx_claim_len = 0;
+static size_t s_rx_claim_pos = 0;
 
 bool Bootloader_Mode = false;
 bool Ack_Received = false;
@@ -41,10 +43,15 @@ void Serial_end( void )
 
 int Serial_available( void )
 {
-	size_t Temp;
-	Temp = Uart1_RxClaim(&s_rx_ptr);
-	if (Temp != 0) {
-		return Temp;
+	if (s_rx_claim_pos < s_rx_claim_len) {
+		return (int)(s_rx_claim_len - s_rx_claim_pos);
+	}
+
+	s_rx_claim_len = Uart1_RxClaim(&s_rx_ptr);
+	s_rx_claim_pos = 0;
+
+	if (s_rx_claim_len != 0) {
+		return (int)s_rx_claim_len;
 	}
 	return 0;
 }
@@ -58,9 +65,14 @@ int Serial_read( void )
 {
 	uint8_t data = 0;
 
-	if (s_rx_ptr != NULL) {
-		data = *s_rx_ptr;
-		s_rx_ptr++;
+	if (s_rx_ptr != NULL && s_rx_claim_pos < s_rx_claim_len) {
+		data = s_rx_ptr[s_rx_claim_pos];
+		s_rx_claim_pos++;
+		if (s_rx_claim_pos >= s_rx_claim_len) {
+			s_rx_ptr = NULL;
+			s_rx_claim_len = 0;
+			s_rx_claim_pos = 0;
+		}
 	}
 
     return data;

@@ -10,6 +10,12 @@ static const char *TAG3 = "Unit Task : ";
 #define BLE_POLLING_MIN_LEN 40
 #define BLE_DEBUG_MIN_LEN 48
 
+static bool s_ext_cnt_initialized = false;
+static byte s_ext_cnt_info = 0;
+static byte s_ext_cnt_setting = 0;
+static byte s_ext_cnt_settemp = 0;
+static byte s_ext_cnt_weekly = 0;
+
 TaskHandle_t Unit_Task_xHandle = NULL;
 
 _WBM_Com_State WBM_Com_State;
@@ -58,6 +64,16 @@ static void WBM_Polling_Base_Data_Parse(byte* rxBuffer);
 static void WBM_Debug_Data_Parse(byte* rxBuffer);
 static void WBM_Read_Eeprom_Data_Parse(byte* rxBuffer);
 static void WBM_Write_Eeprom_Data_Parse(byte* rxBuffer);
+static void unit_comm_seed_external_counters(void);
+
+static void unit_comm_seed_external_counters(void)
+{
+	s_ext_cnt_info = gRDEeprom.cntUpdate_info;
+	s_ext_cnt_setting = gRDEeprom.cntUpdate_SettingPar;
+	s_ext_cnt_settemp = gRDEeprom.cntUpdate_SetTemp;
+	s_ext_cnt_weekly = gRDEeprom.cntUpdate_dayProg;
+	s_ext_cnt_initialized = true;
+}
 
 static void Unit_event_task(void *pvParameters)
 {
@@ -158,6 +174,7 @@ static void Unit_event_task(void *pvParameters)
 						retriesCounter = 0;
 						Eeprom_Data_received = false;
 						Read_Eeprom_Request_Index = 0;
+						s_ext_cnt_initialized = false;
 					}
 					
 				val_ret = Read_Message();
@@ -216,7 +233,7 @@ static void Unit_event_task(void *pvParameters)
 									}
 									WBM_Debug_Data_Parse ( buff_ser1 );
 									Eeprom_Data_received = false;
-									ESP_LOGI(TAG1, "Debug Data Received" );
+									ESP_LOGI(TAG1, "Debug Data Received (len=%u)", (unsigned)debug_data_len );
 									free(debug_data);
 								}
 							else
@@ -370,6 +387,7 @@ static void Unit_event_task(void *pvParameters)
 				case WBM_Error:
 	                    ble_set_runtime_ready(false);
 	                    gpio_set_level( Wifi_Ready, 0);
+						s_ext_cnt_initialized = false;
 					break;
 		}
         vTaskDelay(1);
@@ -606,6 +624,7 @@ void Connect_To_Unit ( void )
 			address = (const char *)&gRDEeprom.SerialString;
 
 			mqtt_subscribe_app_topics(address);
+			unit_comm_seed_external_counters();
 
 			vTaskDelay(350);
 
@@ -739,6 +758,10 @@ void Connect_To_Unit ( void )
 void WBM_Polling_Base_Data_Parse ( byte* rxBuffer )
 {
 	int eventsCounter;
+
+	if (!s_ext_cnt_initialized) {
+		unit_comm_seed_external_counters();
+	}
 		
 	gKTSData.Measure_Temp[ 0 ]	= ((float) MAKESHORT( rxBuffer, IRSP_MEASURE_TEMP_1_HI, IRSP_MEASURE_TEMP_1_LO ) / 10.0);
 	gKTSData.Measure_Temp[ 1 ]	= ((float) MAKESHORT( rxBuffer, IRSP_MEASURE_TEMP_2_HI, IRSP_MEASURE_TEMP_2_LO ) / 10.0);
@@ -811,24 +834,36 @@ void WBM_Polling_Base_Data_Parse ( byte* rxBuffer )
 		
 	}
 	
-	if (gKTSData.CntUpdate_info != gRDEeprom.cntUpdate_info)
+	if (gKTSData.CntUpdate_info != s_ext_cnt_info)
 		{
 				Read_Eeprom_Request_Index |= 0x1;
+				ESP_LOGI(TAG1, "EEPROM external change detected: INFO %u->%u",
+				         (unsigned)s_ext_cnt_info, (unsigned)gKTSData.CntUpdate_info);
+				s_ext_cnt_info = gKTSData.CntUpdate_info;
 		}
 
-	if (gKTSData.CntUpdate_SettingPar != gRDEeprom.cntUpdate_SettingPar)
+	if (gKTSData.CntUpdate_SettingPar != s_ext_cnt_setting)
 		{
 				Read_Eeprom_Request_Index |= 0x2;
+				ESP_LOGI(TAG1, "EEPROM external change detected: SETTING %u->%u",
+				         (unsigned)s_ext_cnt_setting, (unsigned)gKTSData.CntUpdate_SettingPar);
+				s_ext_cnt_setting = gKTSData.CntUpdate_SettingPar;
 		}
 
-	if (gKTSData.CntUpdate_SetTemp != gRDEeprom.cntUpdate_SetTemp)
+	if (gKTSData.CntUpdate_SetTemp != s_ext_cnt_settemp)
 		{
 				Read_Eeprom_Request_Index |= 0x4;
+				ESP_LOGI(TAG1, "EEPROM external change detected: SETTEMP %u->%u",
+				         (unsigned)s_ext_cnt_settemp, (unsigned)gKTSData.CntUpdate_SetTemp);
+				s_ext_cnt_settemp = gKTSData.CntUpdate_SetTemp;
 		}
 
-	if (gKTSData.CntUpdate_dayProg != gRDEeprom.cntUpdate_dayProg)
+	if (gKTSData.CntUpdate_dayProg != s_ext_cnt_weekly)
 		{
 				Read_Eeprom_Request_Index |= 0x8;
+				ESP_LOGI(TAG1, "EEPROM external change detected: WEEKLY %u->%u",
+				         (unsigned)s_ext_cnt_weekly, (unsigned)gKTSData.CntUpdate_dayProg);
+				s_ext_cnt_weekly = gKTSData.CntUpdate_dayProg;
 		}
 		
 	// Aggiorna il timer dell'ultimo polling ricevuto
