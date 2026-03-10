@@ -114,6 +114,23 @@ static void mqtt_set_last_error(const char *message) {
     strlcpy(s_last_error, message, sizeof(s_last_error));
 }
 
+static bool mqtt_apply_eeprom_payload(const uint8_t *payload, size_t payload_len) {
+    const size_t struct_len = sizeof(gRDEeprom);
+    if (payload == NULL || payload_len < 241) {
+        return false;
+    }
+
+    memset(&gRDEeprom, 0, struct_len);
+    size_t copy_len = payload_len;
+    if (copy_len > struct_len) {
+        copy_len = struct_len;
+    }
+    memcpy(&gRDEeprom, payload, copy_len);
+    ESP_LOGI(TAG_MQTT_ENDPOINT, "EEPROM write accepted len=%u copied=%u struct=%u",
+             (unsigned)payload_len, (unsigned)copy_len, (unsigned)struct_len);
+    return true;
+}
+
 static bool mqtt_extract_serial_from_eeprom(char *out, size_t out_size) {
     if (out == NULL || out_size == 0) {
         return false;
@@ -858,9 +875,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             printf("DATA=%.*s\r\n", event->data_len, event->data);
 
             if (mqtt_topic_equals(event, hw_eeprom_topic) || (serial_valid && mqtt_topic_equals(event, serial_eeprom_topic))) {
-                if (event->data_len != (int)sizeof(gRDEeprom)) {
+                if (!mqtt_apply_eeprom_payload((const uint8_t *)event->data, (size_t)event->data_len)) {
                     ESP_LOGW(TAG_MQTT_ENDPOINT,
-                             "EEPROM write ignored: invalid payload len=%d expected=%u",
+                             "EEPROM write ignored: invalid payload len=%d expected-min=241 expected-struct=%u",
                              event->data_len,
                              (unsigned)sizeof(gRDEeprom));
                     mqtt_set_last_error("eeprom write invalid payload length");
@@ -869,7 +886,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     break;
                 }
 
-                memcpy(&gRDEeprom, event->data, sizeof(gRDEeprom));
                 ESP_LOGI(TAG_MQTT_ENDPOINT, "Speed : %d", gRDEeprom.sel_idxStepMotors);
                 Read_Eeprom_Request_Index |= 0x800;
                 Read_Eeprom_Request_Index |= 0x1000;
